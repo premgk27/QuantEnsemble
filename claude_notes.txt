@@ -110,3 +110,12 @@
   Want me to go deeper on any specific part — like how to
    compute specific features, or how to structure the
   target variable?
+
+
+###
+
+Simple example: if you have 20 features, you want at least 1,000-2,000 rows of data to train on.
+
+  Why? XGBoost needs to learn patterns from your data. Each feature adds complexity — more
+  "dimensions" the model has to figure out. If you have 100 features but only 200 rows, the model can
+   find patterns that are pure noise/coincidence and memorize them. That's overfitting.
