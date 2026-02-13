@@ -28,6 +28,104 @@ With monthly models you need to be much more deliberate about feature selection 
 
 ---
 
+## Data
+
+### Timeframes
+- **4h bars (primary):** ~11,000 rows, 2004–2026. Enough for 30 features (366x sample-to-feature ratio).
+- **Daily bars:** Secondary timeframe for comparison and multi-timeframe features.
+- **1h bars: NOT needed.** Adds noise, not signal. Revisit only if 4h+daily underperform.
+
+### Data Sources
+- **OHLCV (4h):** `/Users/prgk/Downloads/charts/BATS_SPY, 240, ma, full data.csv`
+- **OHLCV (daily):** `/Users/prgk/Downloads/charts/BATS_SPY, 1D.csv`
+- **VIX:** CBOE:VIX from TradingView (daily + 4h)
+- **Sector ETFs:** XLK, XLE, XLF, XLV, XLY, XLP, XLI, XLB, XLU, XLRE, XLC
+
+### Data Rules
+- Combine all historical splits into single files — walk-forward CV handles train/test splitting.
+- Drop precomputed indicators from TradingView exports — compute all features from raw OHLCV ourselves.
+- Keep only: time, open, high, low, close, volume.
+
+### Sample-to-Feature Ratio
+- Rule of thumb: need 50-100x more samples than features (financial data is noisy).
+- 4h (~11,000 rows) with 30 features = 366x ratio — very comfortable.
+- Daily (~2,500 rows) with 30 features = 83x ratio — tight but OK.
+
+---
+
+## Feature Set (Top 30)
+
+### A. Returns & Momentum (8 features)
+| # | Feature | Notes |
+|---|---------|-------|
+| 1 | Log returns (1d, 2d, 5d, 10d, 20d) | Multi-scale momentum. 5 features. |
+| 2 | Lagged returns (t-1, t-2, t-3) | Temporal context for XGBoost. NOT lagged prices (non-stationary). |
+| 3 | ROC (Rate of Change, 10d) | Pure momentum magnitude |
+| 4 | Momentum divergence (return_5d - return_20d) | Acceleration/deceleration signal |
+
+### B. Trend (5 features)
+| # | Feature | Notes |
+|---|---------|-------|
+| 5 | EMA ratios: close/EMA_12, close/EMA_26, close/EMA_50 | Price distance from trend at 3 scales |
+| 6 | MACD histogram | Momentum acceleration |
+| 7 | ADX-14 | Trend strength. >25=trending, <20=range-bound |
+
+### C. Mean Reversion / Oscillators (5 features)
+| # | Feature | Notes |
+|---|---------|-------|
+| 8 | RSI-14 | Top feature in most XGBoost studies |
+| 9 | Stochastic %K (14) | Complements RSI — based on price range |
+| 10 | Bollinger Band %B (20, 2std) | Price position within bands (0-1) |
+| 11 | Bollinger Band Width | Volatility squeeze detection |
+| 12 | CCI-20 | Unbounded — extremes (>200, <-200) are powerful |
+
+### D. Volatility (5 features)
+| # | Feature | Notes |
+|---|---------|-------|
+| 13 | ATR-14 | Core volatility measure |
+| 14 | Garman-Klass volatility | Uses full OHLC, 5-8x more efficient than close-to-close |
+| 15 | Vol ratio (5d/20d realized vol) | Short-term vol expanding or compressing? |
+| 16 | Rolling std of returns (20d) | Historical volatility |
+| 17 | Intraday range ratio: (high-low)/close | Bar-level volatility |
+
+### E. Volume (4 features)
+| # | Feature | Notes |
+|---|---------|-------|
+| 18 | OBV (On-Balance Volume) | Tree models excel at OBV-price divergences |
+| 19 | Volume ratio (volume / 20d avg) | Abnormal activity detection |
+| 20 | MFI-14 (Money Flow Index) | Volume-weighted RSI |
+| 21 | ADI (Accumulation/Distribution) | Complements OBV |
+
+### F. Price Structure (3 features)
+| # | Feature | Notes |
+|---|---------|-------|
+| 22 | Close position in range: (close-low)/(high-low) | Where price closed in bar (0=low, 1=high) |
+| 23 | Gap: (open - prev_close) / prev_close | Overnight information flow |
+| 24 | Rolling mean ratio: close / SMA_20 | Price relative to short-term average |
+
+### G. Regime Detection (3 features)
+| # | Feature | Notes |
+|---|---------|-------|
+| 25 | Rolling autocorrelation (20-period, lag-1) | Positive=trending, negative=mean-reverting |
+| 26 | Rolling skewness (20d returns) | Negative skew precedes drawdowns |
+| 27 | Rolling kurtosis (20d returns) | Fat tails detection |
+
+### H. External Context (3 features — optional, needs extra data)
+| # | Feature | Notes |
+|---|---------|-------|
+| 28 | VIX close | Fear gauge, negatively correlated with equities |
+| 29 | Sector ETF return | Stock rarely moves against its sector |
+| 30 | Day of week (sin/cos encoded) | Weak signal — first to prune if needed. 2 features (sin+cos). |
+
+### Feature Rules
+- All features must be stationary (returns and ratios, never raw prices).
+- Normalize using only past data (rolling windows, not full dataset).
+- After computing, check correlation matrix — drop one of any pair >0.9.
+- For 4h bars, translate day-based periods to bar counts (e.g., 14-day RSI → 91-bar RSI).
+- Target variable: next-period return (or sign of next-period return).
+
+---
+
 ## Ensemble & Meta-Model Strategy
 
 ### Why Ensemble?
@@ -82,10 +180,9 @@ Once the 2-model ensemble works, consider adding:
 **Objective:** Build the full pipeline and establish a working baseline.
 
 **Step 1 — Feature Engineering**
-- Price-derived: returns (1d, 5d, 10d, 20d), RSI, moving average crossovers, Bollinger Band position, ATR, abnormal volume
-- Volatility: realized vol, vol ratio (short/long), intraday range
-- Sentiment: news-based (if available)
-- Target: sign or magnitude of next-day (or next 1-5 day) return
+- Compute all 30 features from raw OHLCV (see Feature Set above)
+- Both 4h and daily timeframes
+- Target: sign or magnitude of next-period return
 
 **Step 2 — Base Models**
 - Train Ridge/Lasso regression on clean features
