@@ -311,11 +311,34 @@ def compute_day_of_week(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def compute_target(df: pd.DataFrame, timeframe: str = "daily") -> pd.DataFrame:
-    """Next-period return and its sign."""
+    """Target variables for prediction.
+
+    Targets (all use future data via shift(-N), so only valid for training):
+      - target_ret: next-bar log return (original)
+      - target_sign: sign of next-bar return
+      - target_ret_5: forward 5-bar cumulative log return (smoother)
+      - target_sign_5: sign of forward 5-bar return
+      - target_ma_dir: direction of SMA_20 over next 5 bars (+1=rising, -1=falling)
+    """
     out = pd.DataFrame(index=df.index)
     close = df["close"]
+
+    p5 = _period(5, timeframe)
+    p20 = _period(20, timeframe)
+
+    # Original: next-bar return
     out["target_ret"] = np.log(close.shift(-1) / close)
     out["target_sign"] = np.sign(out["target_ret"])
+
+    # Forward 5-bar cumulative return (smoother target)
+    out["target_ret_5"] = np.log(close.shift(-p5) / close)
+    out["target_sign_5"] = np.sign(out["target_ret_5"])
+
+    # MA direction: is SMA_20 rising or falling over next 5 bars?
+    # Compare SMA_20 at t+5 vs SMA_20 at t
+    sma20 = close.rolling(p20).mean()
+    out["target_ma_dir"] = np.sign(sma20.shift(-p5) - sma20)
+
     return out
 
 
@@ -351,8 +374,10 @@ def build_features(df: pd.DataFrame, timeframe: str = "daily") -> pd.DataFrame:
     feature_cols = [c for c in result.columns if not c.startswith("target_")]
     result = result.dropna(subset=feature_cols)
 
-    # Drop last row (target is NaN because we shifted -1)
-    result = result.iloc[:-1]
+    # Drop trailing rows where forward-looking targets are NaN
+    # (target_ret_5 and target_ma_dir need 5+ future bars)
+    target_cols = [c for c in result.columns if c.startswith("target_")]
+    result = result.dropna(subset=target_cols)
 
     return result
 

@@ -124,6 +124,95 @@ With monthly models you need to be much more deliberate about feature selection 
 - For 4h bars, translate day-based periods to bar counts (e.g., 14-day RSI → 91-bar RSI).
 - Target variable: next-period return (or sign of next-period return).
 
+### Feature Engineering Results
+
+**Pipeline output (zero nulls after warmup trimming):**
+- Daily: 8,295 rows × 37 features + 2 targets (1993-03 to 2026-02)
+- 4h: 10,827 rows × 37 features + 2 targets (2004-07 to 2026-02)
+
+**Target columns:**
+- `target_ret` — log return of next bar: `ln(close[t+1] / close[t])`
+- `target_sign` — sign of next-bar return: +1 (up), -1 (down), 0 (flat)
+
+**Correlated pairs to prune (>0.9) — drop left, keep right:**
+| Drop | Keep | Reason | Corr |
+|------|------|--------|------|
+| `roc_10d` | `log_ret_10d` | Log returns are mathematically cleaner (additive) | 0.999 |
+| `cci_20` | `bb_pctb` | BB %B is bounded (0-1), more interpretable | 0.983 |
+| `adi` | `obv` | OBV is simpler and more widely used | 0.977 |
+| `close_sma20_ratio` | `ema_ratio_26` | EMA is more responsive, already have 3 EMA ratios | 0.963 |
+| `ret_std_20d` | `gk_vol` | Garman-Klass uses full OHLC (5-8x more efficient) | 0.950 |
+| `ema_ratio_50` | `ema_ratio_26` | 26 and 50 are too similar; keep 12 and 26 for two scales | 0.948 |
+
+**After pruning: ~31 features** — within the 25-30 target range (comfortable sample-to-feature ratios: 4h=349x, daily=268x).
+
+**Code:** `src/data_loader.py` (CSV loading), `src/features.py` (all feature computation).
+
+### Base Model Results (Walk-Forward CV, Expanding Window)
+
+**Config:** initial_train=1,250, step=20, target=`target_ret` (regression), 5bps transaction cost.
+
+**Daily (8,295 samples, 31 features, ~7,045 OOS predictions):**
+
+| Metric | Ridge | XGBoost | RF |
+|--------|-------|---------|-----|
+| Sharpe (gross) | 0.191 | -0.006 | **0.437** |
+| Sharpe (net, 5bps) | -0.137 | -0.392 | **0.242** |
+| Dir Accuracy | 51.1% | 49.1% | **53.4%** |
+| Profit Factor (gross) | 1.04 | 1.00 | **1.09** |
+| Max DD (gross) | 0.625 | 1.369 | **0.511** |
+| Avg Turnover | 0.506 | 0.596 | **0.301** |
+
+**4h (10,827 samples, 31 features, ~9,577 OOS predictions):**
+
+| Metric | Ridge | XGBoost | RF |
+|--------|-------|---------|-----|
+| Sharpe (gross) | 0.277 | 0.051 | **0.435** |
+| Sharpe (net, 5bps) | -0.303 | -0.444 | **0.143** |
+| Dir Accuracy | 50.7% | 49.2% | **53.3%** |
+| Profit Factor (gross) | 1.06 | 1.01 | **1.09** |
+| Max DD (gross) | 0.351 | 0.671 | **0.340** |
+| Avg Turnover | 0.605 | 0.517 | **0.304** |
+
+**Key findings:**
+- RF dominates on both timeframes — best Sharpe, lowest turnover, only net-positive model.
+- XGBoost overfits despite regularization (low SNR in financial data).
+- Ridge has a thin edge wiped out by high turnover (~50-60%).
+- RF's low turnover (0.30) is the key advantage — it naturally produces smoother predictions.
+- Daily RF slightly better net Sharpe (0.242 vs 0.143) due to lower per-bar cost impact.
+- No leakage red flags (all Sharpe < 1).
+
+**Code:** `src/train.py` (walk-forward CV, all 3 models). Usage: `uv run python src/train.py [ridge,xgboost,rf] [daily|4h]`
+
+### Turnover Filter Results (Step 4.5)
+
+**Best filter: EMA alpha=0.5 + dead-zone 50th percentile**
+
+| Config | Sharpe(gross) | Sharpe(net) | Turnover | PF(net) |
+|--------|---------------|-------------|----------|---------|
+| RF raw (no filter) | 0.437 | 0.242 | 0.301 | 1.05 |
+| **RF + ema=0.5+dz=50pct** | **0.340** | **0.313** | **0.041** | **1.06** |
+
+- Turnover reduced 86% (0.301→0.041). Net Sharpe improved 0.242→0.313.
+- Gross Sharpe drops (fewer trades = less exposure) but net improves because cost savings dominate.
+- Filters are post-model — they don't change training, just how we trade on predictions.
+
+### Ensemble Results (Step 5)
+
+**Ensembles don't help — XGBoost (49.1% accuracy) is actively harmful.**
+
+| Model | Net Sharpe (raw) | Net Sharpe (filtered) |
+|-------|------------------|-----------------------|
+| RF alone | 0.242 | **0.313** |
+| Equal weight (3 models) | -0.373 | 0.233 |
+| RF-heavy (0.6/0.2/0.2) | -0.377 | 0.139 |
+
+- Including XGBoost in any ensemble degrades performance.
+- Ensemble concept requires base models with positive edge; revisit when XGBoost improves.
+- **Current best strategy: RF + ema=0.5+dz=50pct filter (net Sharpe 0.313).**
+
+**Code:** `src/train.py` (includes `apply_filters()`, `sweep_filters()`, `build_ensembles()`). Saved to `outputs/ensemble_results_daily.pkl`.
+
 ---
 
 ## Ensemble & Meta-Model Strategy
@@ -171,6 +260,41 @@ Once the 2-model ensemble works, consider adding:
 - Random Forest (uncorrelated tree-based errors)
 - Simple neural network (different inductive bias)
 - Naive momentum/mean-reversion signal (simple but often uncorrelated)
+
+---
+
+## Research: MA Trend + Pullback Entry Strategy
+
+**Concept:** Two-stage approach — (1) RF predicts MA direction, (2) combine with price position relative to MA for entry timing. Trade pullbacks in the direction of the trend.
+
+**Signal logic:**
+- MA rising + price below MA → strong long (+1.0, buying the pullback)
+- MA falling + price above MA → strong short (-1.0, selling the bounce)
+- MA rising + price above MA → weak long (+0.5, trend priced in)
+- MA falling + price below MA → weak short (-0.5, trend priced in)
+
+**SPY daily results (initial test):**
+- MA direction accuracy: 88.5% — but misleading due to class imbalance (SPY SMA_20 rises 66% of the time)
+- All variants net Sharpe negative (-0.11 to -0.17)
+- Underperforms base RF (target_ret, net Sharpe 0.313 filtered)
+
+**Why it didn't work on SPY:**
+- SMA_20 direction is too slow/easy — 88.5% accuracy mostly reflects the base rate
+- By the time SMA_20 changes direction, the move is largely over
+- Entry timing (pullback logic) did help with drawdown reduction
+
+**Future improvements to try:**
+- Faster MA target (EMA_12 direction instead of SMA_20)
+- Predict `target_ret_5` (5-bar forward return) — smoother than 1-bar, more actionable than MA direction
+- Test on trending/more balanced assets (TLT, GLD) where MA direction isn't 66/34 skewed
+- Use MA direction as a **regime filter on top of base RF** rather than standalone strategy
+
+**New target columns added to features.py:**
+- `target_ret_5`: Forward 5-bar cumulative log return
+- `target_sign_5`: Sign of forward 5-bar return
+- `target_ma_dir`: SMA_20 direction over next 5 bars (+1=rising, -1=falling)
+
+**Code:** `src/strategy_ma_trend.py` (standalone, does not modify train.py)
 
 ---
 
