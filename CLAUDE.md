@@ -209,9 +209,167 @@ With monthly models you need to be much more deliberate about feature selection 
 
 - Including XGBoost in any ensemble degrades performance.
 - Ensemble concept requires base models with positive edge; revisit when XGBoost improves.
-- **Current best strategy: RF + ema=0.5+dz=50pct filter (net Sharpe 0.313).**
+- **Superseded by feature reduction experiment below.**
 
 **Code:** `src/train.py` (includes `apply_filters()`, `sweep_filters()`, `build_ensembles()`). Saved to `outputs/ensemble_results_daily.pkl`.
+
+### Feature Reduction & Target Experiment (Step 5.5)
+
+**Tested:** 2 models (RF, XGBoost heavy reg) × 5 targets × 4 feature sets = 40 configurations.
+
+**Feature sets:**
+- `full_31` — all features after correlation pruning
+- `perm_15` / `perm_12` — permutation importance selected (unreliable — all values ~0 due to low SNR)
+- `curated_14` — domain knowledge, minimal redundancy:
+  `log_ret_5d, log_ret_20d, mom_divergence, ema_ratio_12, ema_ratio_26, macd_hist, rsi_14, bb_width, gk_vol, vol_ratio, vol_ratio_20d, close_pos_range, gap, dow_sin`
+
+**Targets:**
+- `target_ret` — next-bar log return (baseline)
+- `target_ret_risknorm` — next-bar return / trailing 20d vol
+- `target_ret5_volnorm` — 5-bar forward return / trailing vol (hold=5 bars)
+- `target_trend_persist` — does 5d forward return match 20d trailing return direction?
+- `target_bucket` — 3-class: strong down (<-0.5%), neutral, strong up (>+0.5%)
+
+**Top results (sorted by filtered net Sharpe):**
+
+| Rank | Model | Target | Features | Net Sharpe | Turnover | MaxDD |
+|------|-------|--------|----------|-----------|----------|-------|
+| 1 | RF | bucket | curated_14 | **0.607** | 0.061 | 0.52 |
+| 2 | RF | bucket | perm_15 | **0.570** | 0.038 | 0.47 |
+| 3 | XGB | bucket | curated_14 | **0.520** | 0.119 | 0.65 |
+| 4 | RF | bucket | full_31 | **0.493** | 0.049 | 0.59 |
+| 5 | XGB | bucket | perm_15 | **0.471** | 0.080 | 0.58 |
+| 6 | RF | ret5_volnorm | curated_14 | **0.426** | 0.007 | 0.84 |
+| 7 | RF | ret_risknorm | curated_14 | **0.400** | 0.030 | 0.60 |
+
+**Key findings:**
+- **Target design > model tuning.** `target_bucket` nearly doubled the benchmark (0.607 vs 0.313). The neutral class acts as a built-in dead-zone — model learns when to abstain.
+- **Curated 14 > data-driven selection.** Domain knowledge beats permutation importance consistently.
+- **XGBoost finally works** with heavy reg (max_depth=2, lr=0.02, min_child_weight=50) + bucketed target + curated features → 0.520 net Sharpe. Two models with positive edge makes ensembles viable.
+- **`target_ret5_volnorm`** is best for trend following (hold=5, near-zero turnover 0.007).
+- XGBoost on `target_ret` at 0.441 with 0.000 turnover is FAKE — always predicts long (SPY upward bias).
+
+**Current best: RF + target_bucket + curated_14 = 0.607 net Sharpe.**
+
+**Code:** `src/experiment_feature_reduction.py`. Saved to `outputs/feature_reduction_experiment_daily.pkl`.
+
+### Quick Wins Experiment (Step 5.6)
+
+**Vol-adjusted bucket (±0.5 std of trailing 20d returns):**
+- RF: 0.432 net Sharpe, turnover 0.012 — lower Sharpe than fixed bucket (0.607) but near-zero turnover.
+- The wider dynamic bands during high-vol classify more days as neutral → misses big directional moves.
+- **Fixed ±0.5% bucket wins** — big moves during high vol are exactly when the signal is strongest.
+
+**RF + XGBoost ensemble on bucketed target:**
+
+| Config | Net Sharpe | Turnover | MaxDD |
+|--------|-----------|----------|-------|
+| RF alone | 0.607 | 0.061 | 0.52 |
+| ENS: agree_only | 0.618 | 0.067 | 0.70 |
+| ENS: rf_unless_disagree | **0.612** | **0.048** | 0.62 |
+| XGB alone | 0.520 | 0.119 | 0.65 |
+
+- `rf_unless_disagree` is the best risk-adjusted: 0.612 Sharpe, lower turnover (0.048), moderate drawdown (0.62). Goes neutral when models actively disagree.
+- Marginal improvement over RF alone — the real next lever is more data (multi-asset), not more model complexity.
+
+**Code:** `src/experiment_quick_wins.py`. Saved to `outputs/quick_wins_daily.pkl`.
+
+### Multi-Asset Data
+
+| Asset | Type | Timeframe | Rows | Start | Path |
+|-------|------|-----------|------|-------|------|
+| SPY | US Large Cap | Daily | 8,291 | 1993-03 | `BATS_SPY, 1D.csv` |
+| QQQ | US Tech | Daily | 6,751 | 1999-04 | `BATS_QQQ, 1D.csv` |
+| IWM | US Small Cap | Daily | 6,443 | 2000-06 | `BATS_IWM, 1D.csv` |
+| DIA | US Blue Chip | Daily | 7,037 | 1998-02 | `BATS_DIA, 1D.csv` |
+| TLT | Long Bonds | Daily | 5,902 | 2002-08 | `BATS_TLT, 1D.csv` |
+| GLD | Gold | Daily | 5,318 | 2004-12 | `BATS_GLD, 1D.csv` |
+
+### Multi-Asset Results (Phase 2A)
+
+**Pooled training (all 4 equity assets stacked) — FAILED:**
+Best pooled: 0.455 overall — worse than every single-asset model.
+Pooled MaxDD 5-10x worse (3-5 vs 0.3-0.5). **Conclusion: Pooling hurts. Train per-asset.**
+
+**Single-asset RF + target_bucket + curated_14 (6 assets):**
+
+| Asset | Net Sharpe | WinRate | Ann Ret | Tot Ret | Turnover | MaxDD |
+|-------|-----------|---------|---------|---------|----------|-------|
+| **QQQ** | **0.918** | 55.4% | 21.8% | 4.30 | 0.110 | 0.41 |
+| SPY | 0.607 | 53.5% | 12.5% | 3.29 | 0.061 | 0.52 |
+| GLD | 0.561 | 53.0% | 9.6% | 1.48 | 0.038 | 0.63 |
+| TLT | 0.472 | 50.4% | 7.0% | 1.25 | 0.048 | 0.45 |
+| DIA | 0.470 | 53.1% | 8.7% | 1.92 | 0.077 | 0.39 |
+| IWM | 0.458 | 52.7% | 11.8% | 2.30 | 0.147 | 0.54 |
+
+**Equal-weight portfolio (6 assets):**
+- Sharpe: 0.656, WinRate: 53.1%, Ann Ret: 10.2%, MaxDD: 0.46
+- Diversification ratio: 1.13x (portfolio Sharpe / avg individual Sharpe)
+- 62.9% positive months, only 4 negative years out of 29
+
+**Strategy return correlation matrix:**
+```
+         SPY    QQQ    IWM    DIA    TLT    GLD
+  SPY  1.000  0.657  0.714  0.758  0.073  0.016
+  QQQ  0.657  1.000  0.527  0.425  0.070  0.008
+  IWM  0.714  0.527  1.000  0.558  0.088  0.036
+  DIA  0.758  0.425  0.558  1.000  0.072  0.011
+  TLT  0.073  0.070  0.088  0.072  1.000 -0.059
+  GLD  0.016  0.008  0.036  0.011 -0.059  1.000
+```
+TLT and GLD are essentially uncorrelated with equities — key diversifiers.
+
+**Key findings:**
+- **QQQ is the standout: 0.918 net Sharpe, 21.8% annualized.** More volatile = bigger moves = better signal. Only 1 losing year (2022: -29.7%).
+- **GLD lowest turnover (0.038)** — model is very selective. Recent years strong (2024: +27.7%, 2025: +35.7%).
+- **TLT streaky** — 2007-2008 stayed flat (0 return), but huge when it works (2014: +29.6%, 2021: +34%).
+- **Portfolio (0.656) doesn't beat QQQ alone (0.918)** — equal weighting dilutes QQQ's strength with weaker assets.
+- **QQQ alone beats equal-weight portfolio.** Optimized weighting (overweight QQQ) is the next lever.
+
+### Class Imbalance Problem (Bearish Bias)
+
+**The model has a long bias** — it captures bullish trends well but underperforms in crashes.
+
+**target_bucket class distribution:**
+
+| Asset | Strong Down (-1) | Neutral (0) | Strong Up (+1) | Imbalance |
+|-------|-----------------|-------------|-----------------|-----------|
+| SPY | 23.3% | 48.0% | 28.7% | +5.4% long bias |
+| QQQ | 28.2% | 37.0% | 34.9% | +6.7% long bias |
+| TLT | 25.4% | 47.7% | 26.9% | +1.5% (balanced) |
+| GLD | 25.3% | 45.2% | 29.5% | +4.2% long bias |
+
+**During bear markets (trailing 20d return < -5%), "strong up" is STILL the most common class (42.8% for SPY/QQQ)** because bear market rallies are violent. The fixed ±0.5% threshold captures counter-trend bounces as "strong up" even during crashes.
+
+**Why QQQ handles crashes better than SPY:** QQQ's class balance is more even (28.2% vs 34.9%), and QQQ's bigger moves push more days beyond the ±0.5% threshold in both directions.
+
+**Potential fixes (to test):**
+1. `class_weight="balanced"` in RF — forces equal importance on all 3 classes ← NEXT
+2. Hybrid per-asset feature sets — curated_14 base + asset-specific swaps
+3. Regime-aware training — oversample crash periods or add regime features
+
+### Per-Asset Feature Selection Experiment
+
+**Tested: top 14 features by RF Gini importance (ranked on first 50% of data) vs curated_14.**
+
+| Asset | Curated S(n) | Optimized S(n) | Delta |
+|-------|-------------|----------------|-------|
+| SPY | **0.607** | 0.570 | -0.037 |
+| QQQ | **0.918** | 0.852 | -0.067 |
+| IWM | **0.458** | 0.255 | -0.203 |
+| DIA | 0.470 | **0.646** | +0.175 |
+| TLT | **0.472** | 0.033 | -0.440 |
+| GLD | 0.561 | **0.598** | +0.037 |
+
+**Curated_14 wins on 4 out of 6 assets.** Data-driven feature selection made things worse.
+
+**Why:** Gini importance ranks features by how well they *split trees*, not by how well they *predict returns*. Features like `atr_14` and `intraday_range` rank high because they have high variance (easy splits) but they measure "how much the market is moving" not "which direction." The curated_14 was selected with economic reasoning about what *drives* returns.
+
+**Lesson: Domain knowledge > data-driven selection for low-SNR financial data.**
+
+DIA improved (+0.175) — worth exploring hybrid approach (curated_14 base + 1-2 per-asset swaps by domain reasoning).
+
+**Code:** `src/multi_asset_trend.py`. Saved to `outputs/multi_asset_trend_daily.pkl`.
 
 ---
 

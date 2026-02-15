@@ -339,6 +339,41 @@ def compute_target(df: pd.DataFrame, timeframe: str = "daily") -> pd.DataFrame:
     sma20 = close.rolling(p20).mean()
     out["target_ma_dir"] = np.sign(sma20.shift(-p5) - sma20)
 
+    # Vol-normalized 5-bar forward return: forward_ret_5 / trailing_20d_vol
+    # Normalizes for regime — a 1% move in low-vol is more significant than in high-vol
+    log_ret = np.log(close / close.shift(1))
+    trailing_vol = log_ret.rolling(p20).std()
+    # Scale by sqrt(5) to annualize the 5-bar vol
+    out["target_ret5_volnorm"] = out["target_ret_5"] / (trailing_vol * np.sqrt(p5))
+
+    # Trend persistence: does 5d forward return match trailing 20d return direction?
+    # +1 if both same sign (trend continues), -1 if opposite (trend reverses)
+    trailing_ret_20 = np.log(close / close.shift(p20))
+    out["target_trend_persist"] = np.sign(out["target_ret_5"]) * np.sign(trailing_ret_20)
+
+    # Risk-adjusted 1-bar return: next-bar return / trailing volatility
+    # Teaches model to weight high-conviction setups (same move = bigger signal in calm markets)
+    out["target_ret_risknorm"] = out["target_ret"] / trailing_vol
+
+    # Magnitude-bucketed classification (3 classes):
+    #   -1 = strong down (< -0.5%), 0 = neutral (-0.5% to +0.5%), +1 = strong up (> +0.5%)
+    # Model learns to abstain on neutral days (aligns with dead-zone concept)
+    pct_ret = close.pct_change(-1).shift(-1)  # next-bar pct return (not log)
+    # Actually use the log return for consistency
+    out["target_bucket"] = pd.cut(
+        out["target_ret"],
+        bins=[-np.inf, -0.005, 0.005, np.inf],
+        labels=[-1, 0, 1],
+    ).astype(float)
+
+    # Vol-adjusted bucket: ±0.5 std of trailing 20d returns
+    # Adapts to regime — wider bands during high vol, tighter during calm
+    vol_threshold = 0.5 * trailing_vol
+    out["target_bucket_vol"] = np.where(
+        out["target_ret"] > vol_threshold, 1.0,
+        np.where(out["target_ret"] < -vol_threshold, -1.0, 0.0)
+    )
+
     return out
 
 
