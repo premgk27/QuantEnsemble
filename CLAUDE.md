@@ -7,8 +7,14 @@
 - Features, model complexity, and validation strategy must all change with the prediction horizon.
 - A model that works for daily predictions will NOT work for monthly or longer — treat each horizon as a separate research project.
 
+### Different Timeframes = Different Feature Sets
+- **This is empirically confirmed, not theoretical.** Daily BTC forward selection picked trend+momentum features (ema_ratio_12, log_ret_20d). 4h forward selection picked mean reversion features (lag_ret_2, vol_ratio_20d).
+- Period calibration matters: RSI-14 on 4h bars = 56 hours lookback. Academic research (Hafid et al. 2024) found RSI-30 and Momentum-30 outperform RSI-14 on shorter timeframes.
+- 4h bars are closer to efficient (weaker predictability). Academic finding: "Bitcoin prices were weakly efficient at the hourly frequency, but technical analysis became statistically significantly dominant at the daily horizon" (Gradojevic et al. 2023).
+
 ### Horizon-Specific Feature Guidance
-- **1-5 days:** Recent price action, technical indicators, news sentiment, abnormal volume, short-term mean reversion signals, earnings surprise reactions.
+- **4h bars:** Short-term mean reversion, intraday session effects, hour-of-day patterns, shorter-period oscillators (RSI-30, Stoch-200), volume spikes vs session average.
+- **Daily bars:** Momentum and trend signals dominate. EMA ratios, 20-day returns, volume-weighted indicators (MFI). This is the sweet spot for BTC — confirmed by research and experiments.
 - **1-3 months:** Medium-term momentum (3-12 month returns), earnings revision trends, fund flows, cross-asset signals, relative strength vs peers.
 - **6-12 months:** Valuation ratios (P/E, EV/EBITDA), balance sheet quality, macro regime indicators (yield curve, credit cycle), quality factors.
 
@@ -22,6 +28,10 @@ This multiplies your effective sample size because each month you have 500 relat
 Counterintuitive but critical. For daily predictions, XGBoost with many features can work because you have enough data to support model complexity.
 For monthly or quarterly predictions, you're often better off with a simple linear model using 3-5 well-understood factors, because you simply don't have enough data to reliably train anything more complex without overfitting.
 
+**Less features = more Sharpe (empirically confirmed on BTC).**
+BTC daily: 4 features → 1.287 Sharpe, 31 features → 0.658 Sharpe. Adding features only adds noise.
+The same pattern held for equities: curated_14 beat full_31 consistently.
+
 **Domain knowledge becomes more critical at longer horizons.**
 With daily models you can somewhat brute-force feature discovery — throw in many features and let the model sort it out.
 With monthly models you need to be much more deliberate about feature selection based on economic reasoning, because the data won't save you from bad choices.
@@ -30,16 +40,19 @@ With monthly models you need to be much more deliberate about feature selection 
 
 ## Data
 
-### Timeframes
-- **4h bars (primary):** ~11,000 rows, 2004–2026. Enough for 30 features (366x sample-to-feature ratio).
-- **Daily bars:** Secondary timeframe for comparison and multi-timeframe features.
-- **1h bars: NOT needed.** Adds noise, not signal. Revisit only if 4h+daily underperform.
+### Equity Data Sources
+- **SPY 4h:** `/Users/prgk/Downloads/charts/BATS_SPY, 240, ma, full data.csv`
+- **SPY daily:** `/Users/prgk/Downloads/charts/BATS_SPY, 1D.csv`
+- **QQQ daily:** `/Users/prgk/Downloads/charts/BATS_QQQ, 1D.csv`
+- **IWM daily:** `/Users/prgk/Downloads/charts/BATS_IWM, 1D.csv`
+- **DIA daily:** `/Users/prgk/Downloads/charts/BATS_DIA, 1D.csv`
+- **TLT daily:** `/Users/prgk/Downloads/charts/BATS_TLT, 1D.csv`
+- **GLD daily:** `/Users/prgk/Downloads/charts/BATS_GLD, 1D.csv`
 
-### Data Sources
-- **OHLCV (4h):** `/Users/prgk/Downloads/charts/BATS_SPY, 240, ma, full data.csv`
-- **OHLCV (daily):** `/Users/prgk/Downloads/charts/BATS_SPY, 1D.csv`
-- **VIX:** CBOE:VIX from TradingView (daily + 4h)
-- **Sector ETFs:** XLK, XLE, XLF, XLV, XLY, XLP, XLI, XLB, XLU, XLRE, XLC
+### BTC Data Sources (Kraken — has volume)
+- **BTC daily:** `/Users/prgk/Downloads/charts/KRAKEN_BTCUSD, 1D.csv` — 4,505 rows (2013-10 to 2026-02)
+- **BTC 4h:** `/Users/prgk/Downloads/charts/KRAKEN_BTCUSD, 240.csv` — 22,180 rows (2016-01 to 2026-02)
+- **Important:** Use Kraken, NOT TradingView CRYPTO source — TradingView has no volume data.
 
 ### Data Rules
 - Combine all historical splits into single files — walk-forward CV handles train/test splitting.
@@ -48,486 +61,337 @@ With monthly models you need to be much more deliberate about feature selection 
 
 ### Sample-to-Feature Ratio
 - Rule of thumb: need 50-100x more samples than features (financial data is noisy).
-- 4h (~11,000 rows) with 30 features = 366x ratio — very comfortable.
-- Daily (~2,500 rows) with 30 features = 83x ratio — tight but OK.
+- BTC 4h (22k rows) with 31 features = 710x ratio — very comfortable.
+- BTC daily (4.5k rows) with 4 features = 1,125x ratio — extremely comfortable.
 
 ---
 
-## Feature Set (Top 30)
+## Feature Set — Equities (Daily, curated_14)
 
-### A. Returns & Momentum (8 features)
-| # | Feature | Notes |
-|---|---------|-------|
-| 1 | Log returns (1d, 2d, 5d, 10d, 20d) | Multi-scale momentum. 5 features. |
-| 2 | Lagged returns (t-1, t-2, t-3) | Temporal context for XGBoost. NOT lagged prices (non-stationary). |
-| 3 | ROC (Rate of Change, 10d) | Pure momentum magnitude |
-| 4 | Momentum divergence (return_5d - return_20d) | Acceleration/deceleration signal |
+Selected by domain knowledge + forward selection validation. Beats all data-driven methods.
 
-### B. Trend (5 features)
-| # | Feature | Notes |
-|---|---------|-------|
-| 5 | EMA ratios: close/EMA_12, close/EMA_26, close/EMA_50 | Price distance from trend at 3 scales |
-| 6 | MACD histogram | Momentum acceleration |
-| 7 | ADX-14 | Trend strength. >25=trending, <20=range-bound |
+```
+log_ret_5d, log_ret_20d, mom_divergence,
+ema_ratio_12, ema_ratio_26, macd_hist,
+rsi_14, bb_width, gk_vol, vol_ratio,
+vol_ratio_20d, close_pos_range, gap, dow_sin
+```
 
-### C. Mean Reversion / Oscillators (5 features)
-| # | Feature | Notes |
-|---|---------|-------|
-| 8 | RSI-14 | Top feature in most XGBoost studies |
-| 9 | Stochastic %K (14) | Complements RSI — based on price range |
-| 10 | Bollinger Band %B (20, 2std) | Price position within bands (0-1) |
-| 11 | Bollinger Band Width | Volatility squeeze detection |
-| 12 | CCI-20 | Unbounded — extremes (>200, <-200) are powerful |
-
-### D. Volatility (5 features)
-| # | Feature | Notes |
-|---|---------|-------|
-| 13 | ATR-14 | Core volatility measure |
-| 14 | Garman-Klass volatility | Uses full OHLC, 5-8x more efficient than close-to-close |
-| 15 | Vol ratio (5d/20d realized vol) | Short-term vol expanding or compressing? |
-| 16 | Rolling std of returns (20d) | Historical volatility |
-| 17 | Intraday range ratio: (high-low)/close | Bar-level volatility |
-
-### E. Volume (4 features)
-| # | Feature | Notes |
-|---|---------|-------|
-| 18 | OBV (On-Balance Volume) | Tree models excel at OBV-price divergences |
-| 19 | Volume ratio (volume / 20d avg) | Abnormal activity detection |
-| 20 | MFI-14 (Money Flow Index) | Volume-weighted RSI |
-| 21 | ADI (Accumulation/Distribution) | Complements OBV |
-
-### F. Price Structure (3 features)
-| # | Feature | Notes |
-|---|---------|-------|
-| 22 | Close position in range: (close-low)/(high-low) | Where price closed in bar (0=low, 1=high) |
-| 23 | Gap: (open - prev_close) / prev_close | Overnight information flow |
-| 24 | Rolling mean ratio: close / SMA_20 | Price relative to short-term average |
-
-### G. Regime Detection (3 features)
-| # | Feature | Notes |
-|---|---------|-------|
-| 25 | Rolling autocorrelation (20-period, lag-1) | Positive=trending, negative=mean-reverting |
-| 26 | Rolling skewness (20d returns) | Negative skew precedes drawdowns |
-| 27 | Rolling kurtosis (20d returns) | Fat tails detection |
-
-### H. External Context (3 features — optional, needs extra data)
-| # | Feature | Notes |
-|---|---------|-------|
-| 28 | VIX close | Fear gauge, negatively correlated with equities |
-| 29 | Sector ETF return | Stock rarely moves against its sector |
-| 30 | Day of week (sin/cos encoded) | Weak signal — first to prune if needed. 2 features (sin+cos). |
-
-### Feature Rules
-- All features must be stationary (returns and ratios, never raw prices).
-- Normalize using only past data (rolling windows, not full dataset).
-- After computing, check correlation matrix — drop one of any pair >0.9.
-- For 4h bars, translate day-based periods to bar counts (e.g., 14-day RSI → 91-bar RSI).
-- Target variable: next-period return (or sign of next-period return).
-
-### Feature Engineering Results
-
-**Pipeline output (zero nulls after warmup trimming):**
-- Daily: 8,295 rows × 37 features + 2 targets (1993-03 to 2026-02)
-- 4h: 10,827 rows × 37 features + 2 targets (2004-07 to 2026-02)
-
-**Target columns:**
-- `target_ret` — log return of next bar: `ln(close[t+1] / close[t])`
-- `target_sign` — sign of next-bar return: +1 (up), -1 (down), 0 (flat)
-
-**Correlated pairs to prune (>0.9) — drop left, keep right:**
-| Drop | Keep | Reason | Corr |
-|------|------|--------|------|
-| `roc_10d` | `log_ret_10d` | Log returns are mathematically cleaner (additive) | 0.999 |
-| `cci_20` | `bb_pctb` | BB %B is bounded (0-1), more interpretable | 0.983 |
-| `adi` | `obv` | OBV is simpler and more widely used | 0.977 |
-| `close_sma20_ratio` | `ema_ratio_26` | EMA is more responsive, already have 3 EMA ratios | 0.963 |
-| `ret_std_20d` | `gk_vol` | Garman-Klass uses full OHLC (5-8x more efficient) | 0.950 |
-| `ema_ratio_50` | `ema_ratio_26` | 26 and 50 are too similar; keep 12 and 26 for two scales | 0.948 |
-
-**After pruning: ~31 features** — within the 25-30 target range (comfortable sample-to-feature ratios: 4h=349x, daily=268x).
+**Correlated pairs dropped (>0.9):**
+| Drop | Keep | Corr |
+|------|------|------|
+| `roc_10d` | `log_ret_10d` | 0.999 |
+| `cci_20` | `bb_pctb` | 0.983 |
+| `adi` | `obv` | 0.977 |
+| `close_sma20_ratio` | `ema_ratio_26` | 0.963 |
+| `ret_std_20d` | `gk_vol` | 0.950 |
+| `ema_ratio_50` | `ema_ratio_26` | 0.948 |
 
 **Code:** `src/data_loader.py` (CSV loading), `src/features.py` (all feature computation).
 
-### Base Model Results (Walk-Forward CV, Expanding Window)
+---
 
-**Config:** initial_train=1,250, step=20, target=`target_ret` (regression), 5bps transaction cost.
+## Feature Set — BTC Daily (forward_4, selected by greedy walk-forward Sharpe)
 
-**Daily (8,295 samples, 31 features, ~7,045 OOS predictions):**
+**Winning 4 features: `ema_ratio_12, atr_14, log_ret_20d, mfi_14`**
 
-| Metric | Ridge | XGBoost | RF |
-|--------|-------|---------|-----|
-| Sharpe (gross) | 0.191 | -0.006 | **0.437** |
-| Sharpe (net, 5bps) | -0.137 | -0.392 | **0.242** |
-| Dir Accuracy | 51.1% | 49.1% | **53.4%** |
-| Profit Factor (gross) | 1.04 | 1.00 | **1.09** |
-| Max DD (gross) | 0.625 | 1.369 | **0.511** |
-| Avg Turnover | 0.506 | 0.596 | **0.301** |
+Why they work:
+- `ema_ratio_12` — short-term trend direction (price above/below 12-bar EMA?)
+- `atr_14` — volatility regime (high vol = different market dynamics)
+- `log_ret_20d` — monthly momentum (crypto trends persist strongly)
+- `mfi_14` — money flow index (volume-weighted price action = smart money signal)
 
-**4h (10,827 samples, 31 features, ~9,577 OOS predictions):**
-
-| Metric | Ridge | XGBoost | RF |
-|--------|-------|---------|-----|
-| Sharpe (gross) | 0.277 | 0.051 | **0.435** |
-| Sharpe (net, 5bps) | -0.303 | -0.444 | **0.143** |
-| Dir Accuracy | 50.7% | 49.2% | **53.3%** |
-| Profit Factor (gross) | 1.06 | 1.01 | **1.09** |
-| Max DD (gross) | 0.351 | 0.671 | **0.340** |
-| Avg Turnover | 0.605 | 0.517 | **0.304** |
-
-**Key findings:**
-- RF dominates on both timeframes — best Sharpe, lowest turnover, only net-positive model.
-- XGBoost overfits despite regularization (low SNR in financial data).
-- Ridge has a thin edge wiped out by high turnover (~50-60%).
-- RF's low turnover (0.30) is the key advantage — it naturally produces smoother predictions.
-- Daily RF slightly better net Sharpe (0.242 vs 0.143) due to lower per-bar cost impact.
-- No leakage red flags (all Sharpe < 1).
-
-**Code:** `src/train.py` (walk-forward CV, all 3 models). Usage: `uv run python src/train.py [ridge,xgboost,rf] [daily|4h]`
-
-### Turnover Filter Results (Step 4.5)
-
-**Best filter: EMA alpha=0.5 + dead-zone 50th percentile**
-
-| Config | Sharpe(gross) | Sharpe(net) | Turnover | PF(net) |
-|--------|---------------|-------------|----------|---------|
-| RF raw (no filter) | 0.437 | 0.242 | 0.301 | 1.05 |
-| **RF + ema=0.5+dz=50pct** | **0.340** | **0.313** | **0.041** | **1.06** |
-
-- Turnover reduced 86% (0.301→0.041). Net Sharpe improved 0.242→0.313.
-- Gross Sharpe drops (fewer trades = less exposure) but net improves because cost savings dominate.
-- Filters are post-model — they don't change training, just how we trade on predictions.
-
-### Ensemble Results (Step 5)
-
-**Ensembles don't help — XGBoost (49.1% accuracy) is actively harmful.**
-
-| Model | Net Sharpe (raw) | Net Sharpe (filtered) |
-|-------|------------------|-----------------------|
-| RF alone | 0.242 | **0.313** |
-| Equal weight (3 models) | -0.373 | 0.233 |
-| RF-heavy (0.6/0.2/0.2) | -0.377 | 0.139 |
-
-- Including XGBoost in any ensemble degrades performance.
-- Ensemble concept requires base models with positive edge; revisit when XGBoost improves.
-- **Superseded by feature reduction experiment below.**
-
-**Code:** `src/train.py` (includes `apply_filters()`, `sweep_filters()`, `build_ensembles()`). Saved to `outputs/ensemble_results_daily.pkl`.
-
-### Feature Reduction & Target Experiment (Step 5.5)
-
-**Tested:** 2 models (RF, XGBoost heavy reg) × 5 targets × 4 feature sets = 40 configurations.
-
-**Feature sets:**
-- `full_31` — all features after correlation pruning
-- `perm_15` / `perm_12` — permutation importance selected (unreliable — all values ~0 due to low SNR)
-- `curated_14` — domain knowledge, minimal redundancy:
-  `log_ret_5d, log_ret_20d, mom_divergence, ema_ratio_12, ema_ratio_26, macd_hist, rsi_14, bb_width, gk_vol, vol_ratio, vol_ratio_20d, close_pos_range, gap, dow_sin`
-
-**Targets:**
-- `target_ret` — next-bar log return (baseline)
-- `target_ret_risknorm` — next-bar return / trailing 20d vol
-- `target_ret5_volnorm` — 5-bar forward return / trailing vol (hold=5 bars)
-- `target_trend_persist` — does 5d forward return match 20d trailing return direction?
-- `target_bucket` — 3-class: strong down (<-0.5%), neutral, strong up (>+0.5%)
-
-**Top results (sorted by filtered net Sharpe):**
-
-| Rank | Model | Target | Features | Net Sharpe | Turnover | MaxDD |
-|------|-------|--------|----------|-----------|----------|-------|
-| 1 | RF | bucket | curated_14 | **0.607** | 0.061 | 0.52 |
-| 2 | RF | bucket | perm_15 | **0.570** | 0.038 | 0.47 |
-| 3 | XGB | bucket | curated_14 | **0.520** | 0.119 | 0.65 |
-| 4 | RF | bucket | full_31 | **0.493** | 0.049 | 0.59 |
-| 5 | XGB | bucket | perm_15 | **0.471** | 0.080 | 0.58 |
-| 6 | RF | ret5_volnorm | curated_14 | **0.426** | 0.007 | 0.84 |
-| 7 | RF | ret_risknorm | curated_14 | **0.400** | 0.030 | 0.60 |
-
-**Key findings:**
-- **Target design > model tuning.** `target_bucket` nearly doubled the benchmark (0.607 vs 0.313). The neutral class acts as a built-in dead-zone — model learns when to abstain.
-- **Curated 14 > data-driven selection.** Domain knowledge beats permutation importance consistently.
-- **XGBoost finally works** with heavy reg (max_depth=2, lr=0.02, min_child_weight=50) + bucketed target + curated features → 0.520 net Sharpe. Two models with positive edge makes ensembles viable.
-- **`target_ret5_volnorm`** is best for trend following (hold=5, near-zero turnover 0.007).
-- XGBoost on `target_ret` at 0.441 with 0.000 turnover is FAKE — always predicts long (SPY upward bias).
-
-**Current best: RF + target_bucket + curated_14 = 0.607 net Sharpe.**
-
-**Code:** `src/experiment_feature_reduction.py`. Saved to `outputs/feature_reduction_experiment_daily.pkl`.
-
-### Quick Wins Experiment (Step 5.6)
-
-**Vol-adjusted bucket (±0.5 std of trailing 20d returns):**
-- RF: 0.432 net Sharpe, turnover 0.012 — lower Sharpe than fixed bucket (0.607) but near-zero turnover.
-- The wider dynamic bands during high-vol classify more days as neutral → misses big directional moves.
-- **Fixed ±0.5% bucket wins** — big moves during high vol are exactly when the signal is strongest.
-
-**RF + XGBoost ensemble on bucketed target:**
-
-| Config | Net Sharpe | Turnover | MaxDD |
-|--------|-----------|----------|-------|
-| RF alone | 0.607 | 0.061 | 0.52 |
-| ENS: agree_only | 0.618 | 0.067 | 0.70 |
-| ENS: rf_unless_disagree | **0.612** | **0.048** | 0.62 |
-| XGB alone | 0.520 | 0.119 | 0.65 |
-
-- `rf_unless_disagree` is the best risk-adjusted: 0.612 Sharpe, lower turnover (0.048), moderate drawdown (0.62). Goes neutral when models actively disagree.
-- Marginal improvement over RF alone — the real next lever is more data (multi-asset), not more model complexity.
-
-**Code:** `src/experiment_quick_wins.py`. Saved to `outputs/quick_wins_daily.pkl`.
-
-### Multi-Asset Data
-
-| Asset | Type | Timeframe | Rows | Start | Path |
-|-------|------|-----------|------|-------|------|
-| SPY | US Large Cap | Daily | 8,291 | 1993-03 | `BATS_SPY, 1D.csv` |
-| QQQ | US Tech | Daily | 6,751 | 1999-04 | `BATS_QQQ, 1D.csv` |
-| IWM | US Small Cap | Daily | 6,443 | 2000-06 | `BATS_IWM, 1D.csv` |
-| DIA | US Blue Chip | Daily | 7,037 | 1998-02 | `BATS_DIA, 1D.csv` |
-| TLT | Long Bonds | Daily | 5,902 | 2002-08 | `BATS_TLT, 1D.csv` |
-| GLD | Gold | Daily | 5,318 | 2004-12 | `BATS_GLD, 1D.csv` |
-
-### Multi-Asset Results (Phase 2A)
-
-**Pooled training (all 4 equity assets stacked) — FAILED:**
-Best pooled: 0.455 overall — worse than every single-asset model.
-Pooled MaxDD 5-10x worse (3-5 vs 0.3-0.5). **Conclusion: Pooling hurts. Train per-asset.**
-
-**Single-asset RF + target_bucket + curated_14 (6 assets):**
-
-| Asset | Net Sharpe | WinRate | Ann Ret | Tot Ret | Turnover | MaxDD |
-|-------|-----------|---------|---------|---------|----------|-------|
-| **QQQ** | **0.918** | 55.4% | 21.8% | 4.30 | 0.110 | 0.41 |
-| SPY | 0.607 | 53.5% | 12.5% | 3.29 | 0.061 | 0.52 |
-| GLD | 0.561 | 53.0% | 9.6% | 1.48 | 0.038 | 0.63 |
-| TLT | 0.472 | 50.4% | 7.0% | 1.25 | 0.048 | 0.45 |
-| DIA | 0.470 | 53.1% | 8.7% | 1.92 | 0.077 | 0.39 |
-| IWM | 0.458 | 52.7% | 11.8% | 2.30 | 0.147 | 0.54 |
-
-**Equal-weight portfolio (6 assets):**
-- Sharpe: 0.656, WinRate: 53.1%, Ann Ret: 10.2%, MaxDD: 0.46
-- Diversification ratio: 1.13x (portfolio Sharpe / avg individual Sharpe)
-- 62.9% positive months, only 4 negative years out of 29
-
-**Strategy return correlation matrix:**
+Forward selection trace:
 ```
-         SPY    QQQ    IWM    DIA    TLT    GLD
-  SPY  1.000  0.657  0.714  0.758  0.073  0.016
-  QQQ  0.657  1.000  0.527  0.425  0.070  0.008
-  IWM  0.714  0.527  1.000  0.558  0.088  0.036
-  DIA  0.758  0.425  0.558  1.000  0.072  0.011
-  TLT  0.073  0.070  0.088  0.072  1.000 -0.059
-  GLD  0.016  0.008  0.036  0.011 -0.059  1.000
+Step 1: +ema_ratio_12    Sharpe=1.072
+Step 2: +atr_14          Sharpe=1.092  (+0.020)
+Step 3: +log_ret_20d     Sharpe=1.172  (+0.080)
+Step 4: +mfi_14          Sharpe=1.287  (+0.115)  ← PEAK
+Step 5: +log_ret_1d      Sharpe=1.252  (-0.034)
+Step 6: +vol_ratio       Sharpe=1.170  (-0.082)  → stopped
 ```
-TLT and GLD are essentially uncorrelated with equities — key diversifiers.
 
-**Key findings:**
-- **QQQ is the standout: 0.918 net Sharpe, 21.8% annualized.** More volatile = bigger moves = better signal. Only 1 losing year (2022: -29.7%).
-- **GLD lowest turnover (0.038)** — model is very selective. Recent years strong (2024: +27.7%, 2025: +35.7%).
-- **TLT streaky** — 2007-2008 stayed flat (0 return), but huge when it works (2014: +29.6%, 2021: +34%).
-- **Portfolio (0.656) doesn't beat QQQ alone (0.918)** — equal weighting dilutes QQQ's strength with weaker assets.
-- **QQQ alone beats equal-weight portfolio.** Optimized weighting (overweight QQQ) is the next lever.
+---
 
-### Class Imbalance Problem (Bearish Bias)
+## Feature Set — BTC 4h (CLOSED — daily is the better BTC timeframe)
 
-**The model has a long bias** — it captures bullish trends well but underperforms in crashes.
+**Status: 4h investigated exhaustively. Decision: daily only.**
 
-**target_bucket class distribution:**
+**Round 1 — standard 31 daily features:**
+```
+Step 1: +lag_ret_2         Sharpe=0.244  ← mean reversion signal
+Step 2: +vol_ratio_20d     Sharpe=0.426  ← PEAK
+Steps 3+: all negative → stopped
+Best: 0.426 Sharpe (below 0.5 decision gate)
+```
 
-| Asset | Strong Down (-1) | Neutral (0) | Strong Up (+1) | Imbalance |
-|-------|-----------------|-------------|-----------------|-----------|
-| SPY | 23.3% | 48.0% | 28.7% | +5.4% long bias |
-| QQQ | 28.2% | 37.0% | 34.9% | +6.7% long bias |
-| TLT | 25.4% | 47.7% | 26.9% | +1.5% (balanced) |
-| GLD | 25.3% | 45.2% | 29.5% | +4.2% long bias |
+**Round 2 — expanded 41 features (added intraday-calibrated indicators):**
+Added RSI-30, Stoch-200/30, Momentum-30, Williams %R, Disparity-7, hour_sin/cos, bar_body_ratio per academic research (Hafid et al. 2024).
+```
+Step 1: +vol_ratio         Sharpe=0.244
+Step 2: +disparity_7       Sharpe=0.329
+Step 3: +log_ret_2d        Sharpe=0.380
+Step 4: +adx_14            Sharpe=0.431  ← PEAK
+Steps 5+: negative → stopped
+Best: 0.431 Sharpe — barely improved, still below 0.5 gate
+```
 
-**During bear markets (trailing 20d return < -5%), "strong up" is STILL the most common class (42.8% for SPY/QQQ)** because bear market rallies are violent. The fixed ±0.5% threshold captures counter-trend bounces as "strong up" even during crashes.
+**Conclusion: 4h closed.** Even with purpose-built intraday features, best 4h Sharpe = 0.431 vs buy-and-hold 0.244. Not worth trading costs and infrastructure complexity. The gap between daily (1.287) and 4h (0.431) is structural — academically confirmed that BTC is weakly efficient at hourly/sub-hourly frequencies.
 
-**Why QQQ handles crashes better than SPY:** QQQ's class balance is more even (28.2% vs 34.9%), and QQQ's bigger moves push more days beyond the ±0.5% threshold in both directions.
+**Only useful new 4h feature:** `disparity_7` (close / SMA_7 deviation). Others added minimal value.
 
-**Potential fixes (to test):**
-1. `class_weight="balanced"` in RF — forces equal importance on all 3 classes ← NEXT
-2. Hybrid per-asset feature sets — curated_14 base + asset-specific swaps
-3. Regime-aware training — oversample crash periods or add regime features
+**Why 4h failed:**
+- 4h market is more mean-reverting, not trending — different physics than daily
+- ±0.5% bucket on 4h: 50% neutral class, model barely trades
+- Even with period-calibrated features (RSI-30, Stoch-200), only marginal improvement
+- Structural efficiency limit — not fixable by feature engineering alone
 
-### Per-Asset Feature Selection Experiment
+---
 
-**Tested: top 14 features by RF Gini importance (ranked on first 50% of data) vs curated_14.**
+## Academic Research Findings (2023-2025)
 
-| Asset | Curated S(n) | Optimized S(n) | Delta |
-|-------|-------------|----------------|-------|
-| SPY | **0.607** | 0.570 | -0.037 |
-| QQQ | **0.918** | 0.852 | -0.067 |
-| IWM | **0.458** | 0.255 | -0.203 |
-| DIA | 0.470 | **0.646** | +0.175 |
-| TLT | **0.472** | 0.033 | -0.440 |
-| GLD | 0.561 | **0.598** | +0.037 |
+Key papers on crypto ML prediction:
 
-**Curated_14 wins on 4 out of 6 assets.** Data-driven feature selection made things worse.
+**Feature importance:**
+- Hafid et al. (arXiv:2410.06935, 2024): Top 8 features by χ² test = RSI-30, MACD, Momentum-30, Stochastic %K at 200 and 30 periods, RSI-14. Chi-squared test on XGBoost classifier for BTC direction.
+- Ardia et al. (ScienceDirect, 2025): Technical indicators > blockchain metrics > Google Trends > price lags. Hashrate and block size are top on-chain features.
+- Omole & Enke (Financial Innovation, 2024): 25 on-chain features (from 196 Glassnode metrics) using Boruta selection. Boruta + CNN-LSTM achieved 82.44% directional accuracy.
 
-**Why:** Gini importance ranks features by how well they *split trees*, not by how well they *predict returns*. Features like `atr_14` and `intraday_range` rank high because they have high variance (easy splits) but they measure "how much the market is moving" not "which direction." The curated_14 was selected with economic reasoning about what *drives* returns.
+**Timeframe efficiency:**
+- Gradojevic et al. (Int. Journal of Forecasting, 2023): BTC is weakly efficient at hourly frequency. Technical analysis becomes statistically significant at daily horizon. **Validates our finding that daily > 4h for BTC.**
 
-**Lesson: Domain knowledge > data-driven selection for low-SNR financial data.**
+**Model choice:**
+- XGBoost outperforms deep learning in many studies for tabular features.
+- Temporal Fusion Transformer (TFT) is best for sequential patterns.
+- GRU, LightGBM competitive depending on asset.
 
-DIA improved (+0.175) — worth exploring hybrid approach (curated_14 base + 1-2 per-asset swaps by domain reasoning).
+**On-chain data experiment (free sources — TESTED, didn't improve forward_4):**
+Built `src/onchain_loader.py` with Binance funding rates, Alternative.me Fear & Greed, blockchain.com hash rate.
+forward_4 + hash_rate_ratio = 1.064 Sharpe (WORSE than forward_4 = 1.287).
+Root cause: coverage gaps (47%/34% zeros pre-2019/2018) + hash_rate_ratio redundant with full forward_4.
+hash_rate_ratio does help when paired with ema_ratio_12 alone (1.072 → 1.117).
 
-**Code:** `src/multi_asset_trend.py`. Saved to `outputs/multi_asset_trend_daily.pkl`.
+**Future data sources (premium quality may help — free didn't):**
+- Glassnode API: hashrate, block size, realized value, UTXO metrics (25 Boruta-selected features, full history from 2014+)
+- Binance/Bybit API: open interest, liquidation levels (funding rate free data already tested — patchy)
+- Google Trends: "bitcoin", "blockchain" search volume
+- Premium data has full coverage vs patchy free data; studies using premium → 82%+ accuracy
+
+---
+
+## Equity Model Results Summary
+
+### Baseline (SPY daily, regression target)
+RF dominates: 0.437 gross Sharpe, 0.242 net Sharpe, 53.4% accuracy.
+
+### Best Equity Config: RF + target_bucket + curated_14
+**SPY: 0.607 net Sharpe** after turnover filter (EMA 0.5 + dead-zone 50th pct).
+
+### Multi-Asset Results (6 assets, RF + target_bucket + curated_14)
+
+| Asset | Net Sharpe | WinRate | Ann Ret | Turnover | MaxDD |
+|-------|-----------|---------|---------|----------|-------|
+| **QQQ** | **0.918** | 55.4% | 21.8% | 0.110 | 0.41 |
+| SPY | 0.607 | 53.5% | 12.5% | 0.061 | 0.52 |
+| GLD | 0.561 | 53.0% | 9.6% | 0.038 | 0.63 |
+| TLT | 0.472 | 50.4% | 7.0% | 0.048 | 0.45 |
+| DIA | 0.470 | 53.1% | 8.7% | 0.077 | 0.39 |
+| IWM | 0.458 | 52.7% | 11.8% | 0.147 | 0.54 |
+
+Equal-weight portfolio (6 assets): Sharpe 0.656, 1.13x diversification ratio.
+**QQQ alone (0.918) beats the portfolio (0.656)** — equal weighting dilutes QQQ's edge.
+
+### Key Equity Lessons
+- **Pooled training hurts** — train per-asset independently.
+- **Target design > model tuning.** target_bucket (3-class ±0.5%) doubles Sharpe vs regression target.
+- **class_weight="balanced" fails globally** — hurts bull performance by 3-5x more than it helps crashes. Long bias is correct most of the time.
+- **Probability thresholds don't help** — RF probabilities too clustered, model rarely confident >0.50. target_bucket neutral class already acts as confidence filter.
+- **Curated_14 > data-driven selection** on 4/6 assets. Gini importance misleads.
+
+**Code:** `src/multi_asset_trend.py`. Results: `outputs/multi_asset_trend_daily.pkl`.
+
+---
+
+## BTC Crypto Model Results
+
+### Data
+- **Source:** Kraken BTCUSD (has volume data, unlike TradingView CRYPTO source)
+- **Daily:** 4,505 rows (2013-10 to 2026-02)
+- **4h:** 22,180 rows (2016-01 to 2026-02)
+
+### Bucket Threshold Sweep (BTC Daily)
+
+| Threshold | Sharpe | Turnover | Down% | Neutral% | Up% |
+|-----------|--------|----------|-------|----------|-----|
+| ±0.5% | 0.500 | 0.514 | 37.1% | 20.7% | 42.2% |
+| **±1.0%** | **0.658** | **0.162** | **29.2%** | **36.9%** | **33.9%** |
+| ±1.5% | 0.422 | 0.018 | 23.4% | 49.4% | 27.2% |
+| ±2.0% | 0.502 | 0.003 | 18.9% | 58.9% | 22.2% |
+
+**±1.0% wins** — balanced class distribution with reasonable turnover.
+
+### Bucket Threshold Sweep (BTC 4h)
+
+| Threshold | Sharpe | Turnover | Neutral% |
+|-----------|--------|----------|----------|
+| ±0.1% | -0.028 | 0.743 | 12.9% |
+| ±0.2% | 0.074 | 0.551 | 24.2% |
+| ±0.3% | 0.196 | 0.213 | 34.6% |
+| ±0.4% | 0.176 | 0.050 | 43.0% |
+| **±0.5%** | **0.253** | **0.023** | **50.1%** |
+
+Best 4h threshold is ±0.5% but all results weak. Root cause: wrong feature set for 4h, not threshold.
+
+### BTC Daily Model Results (all feature sets, RF + target_bucket_10)
+
+| Feature Set | N | Sharpe | WinRate | AnnRet | TotRet | Turn | MaxDD | PF |
+|-------------|---|--------|---------|--------|--------|------|-------|-----|
+| **forward_4** | **4** | **1.287** | **52.5%** | **111.1%** | **9.52** | **0.244** | **0.8317** | **1.28** |
+| forward_6 | 6 | 1.170 | 52.4% | 97.2% | 8.66 | 0.273 | 1.0679 | 1.25 |
+| gini_8 | 8 | 0.855 | 51.8% | 64.4% | 6.34 | 0.100 | 1.1144 | 1.18 |
+| equity_curated | 14 | 0.797 | 52.1% | 59.0% | 5.91 | 0.176 | 1.3181 | 1.16 |
+| all_features | 31 | 0.658 | 51.5% | 46.6% | 4.88 | 0.162 | 1.4400 | 1.13 |
+| **Buy & Hold** | — | **0.522** | — | **35.5%** | **3.87** | — | **1.8705** | — |
+
+**forward_4 beats buy-and-hold by 2.5x Sharpe with half the drawdown.**
+
+### BTC Daily Yearly Breakdown (forward_4)
+
+| Year | Return | $(x) | Sharpe | Mo WinR |
+|------|--------|------|--------|---------|
+| 2017 | +2.682 | +1361% | 3.29 | 77.8% |
+| 2018 | +1.497 | +347% | 1.48 | 75.0% |
+| 2019 | +1.821 | +518% | 2.20 | 75.0% |
+| 2020 | +1.164 | +220% | 1.19 | 75.0% |
+| 2021 | +1.591 | +391% | 1.64 | 75.0% |
+| 2022 | -0.613 | -46% | -0.79 | 33.3% |
+| 2023 | +0.353 | +42% | 0.67 | 50.0% |
+| 2024 | +0.741 | +110% | 1.16 | 58.3% |
+| 2025 | +0.533 | +70% | 1.06 | 66.7% |
+
+### BTC Daily Regime Analysis (forward_4)
+
+| Regime | Days | % of OOS | Sharpe | WinRate |
+|--------|------|----------|--------|---------|
+| Bull (trail 60d > +10%) | 1,358 | 42.3% | **2.130** | 53.5% |
+| Bear (trail 60d < -10%) | 926 | 28.8% | **0.725** | 52.6% |
+| Sideways | 929 | 28.9% | **0.561** | 50.9% |
+
+**Model profitable in ALL regimes.** 63.8% long, 36.2% short.
+
+### MaxDD Units Clarification
+MaxDD column is in **log return units**, NOT percentage. Convert: `actual_pct_dd = 1 - exp(-MaxDD_log)`.
+- forward_4 MaxDD: 0.8317 log → **56.4% actual percentage drawdown**
+- Buy & hold MaxDD: 1.8705 log → **84.6% actual percentage drawdown**
+- Calmar ratio (AnnRet / MaxDD%): 111% / 56.4% ≈ **2.0** (excellent, target > 1.0)
+
+### Flat-on-Neutral vs Hold-on-Neutral (forward_4)
+
+| Mode | Sharpe | WinRate | AnnRet | Turnover | MaxDD | PF | FlatTime |
+|------|--------|---------|--------|----------|-------|-----|----------|
+| **Hold neutral** | **1.287** | 52.5% | 111.1% | 0.244 | 0.8317 | 1.28 | 0% |
+| Flat neutral | 1.278 | 53.2% | 100.4% | 0.302 | 0.8317 | 1.33 | 30.3% |
+
+**Conclusion: hold neutral marginally better overall.** Flat neutral improves win rate (53.2%) and PF (1.33) but reduces annual return (100% vs 111%) and increases turnover (+24%). MaxDD identical. Use flat neutral if conservative live trading is preferred and win rate matters for psychology.
+
+### BTC 4h Results (with standard daily-designed features — all weak)
+
+| Feature Set | N | Sharpe | AnnRet | Turn |
+|-------------|---|--------|--------|------|
+| forward_4 | 4 | 0.209 | 4.8% | 0.007 |
+| gini_8 | 8 | 0.281 | 6.6% | 0.004 |
+| all_features | 31 | 0.216 | 5.0% | 0.001 |
+| **Buy & Hold** | — | **0.244** | **5.9%** | — |
+
+Model barely beats buy-and-hold on 4h. Root cause: wrong features + period mismatch.
+
+**Code:** `src/btc_feature_selection.py` (feature selection), `src/btc_model.py` (full model).
+Results: `outputs/btc_model_daily.pkl`.
+
+---
+
+## Feature Selection Methods — Empirical Findings
+
+**Method 1 — RF Gini Importance:** Ranks by tree split ease, not predictive power. Volatile/high-variance features (bb_width, intraday_range, gk_vol) rank high because they're easy to split on. Consistently suboptimal — beats all-features but loses to forward selection.
+
+**Method 2 — Permutation Importance:** Useless. All values near zero on both equities and BTC. Does not work for low-SNR financial data. Confirmed on every dataset tested.
+
+**Method 3 — Forward Selection (greedy walk-forward Sharpe):** Clear winner. Finds features that complement each other, not just individually strong features. Picks the right set reliably. Slow on large datasets (22k rows × 31 candidates = hours). Speed fix: use n_estimators=100 for selection, 500 for final model.
+**Bug fixed (important):** Original code stopped on first negative step after step 4, and returned the final degraded set instead of peak. Fixed: (1) track global best set (`best_ever_selected`), (2) stop only after **2 consecutive** steps with no improvement. Always returns peak Sharpe set.
+
+**Method 4 — Domain Knowledge (curated sets):** Competitive with forward selection on equities (0.607 Sharpe vs 0.570 for data-driven). Faster and more interpretable. For crypto, domain curated features underperform forward selection (0.797 vs 1.287) — forward selection found a better set.
+
+**Rule:** For new assets/timeframes, always run forward selection first. Use domain knowledge to narrow the candidate pool but let data confirm the final set.
 
 ---
 
 ## Ensemble & Meta-Model Strategy
 
-### Why Ensemble?
-- Different model types capture different patterns: linear models find stable proportional relationships; tree models (XGBoost) find nonlinear interactions and conditional effects.
-- Combining models with uncorrelated errors produces a more robust signal than any single model.
-- Correlation of errors matters more than individual accuracy — a weaker model that makes *different* mistakes is more valuable than a second strong model making the same mistakes.
+### When Ensembles Work
+- Need base models with **positive edge independently**. A bad model drags down a good one.
+- Confirmed: including XGBoost (negative Sharpe) in ensembles with RF always hurt performance.
+- Once both RF and XGBoost had positive edge (bucket target + heavy regularization), ensemble marginal benefit: +0.005 to +0.011 Sharpe.
 
-### Base Models
-1. **Linear Regression (Ridge/Lasso/Elastic Net)**
-   - Captures stable, persistent linear relationships (momentum, value, mean reversion).
-   - Very resistant to overfitting.
-   - Interpretable and fast.
-2. **XGBoost (Gradient Boosted Trees)**
-   - Captures nonlinear interactions (e.g., "momentum works when volatility is low AND volume is rising").
-   - Strong on tabular features.
-   - Requires more care to avoid overfitting (regularization, early stopping, feature selection).
-
-### Ensemble Methods (Progressive Complexity)
-
-**Level 1 — Simple Averaging (START HERE)**
-```
-final_signal = 0.5 * linear_pred + 0.5 * xgboost_pred
-```
-Surprisingly effective. Errors are somewhat uncorrelated, so averaging smooths things out.
-
-**Level 2 — Weighted Averaging**
-Use out-of-sample performance to determine weights.
-Optimize weights on a validation set. Adjust over time if one model performs better in recent regimes.
-
-**Level 3 — Stacking (Meta-Learner)**
-- Train base models (linear, XGBoost) on features.
-- Generate **out-of-sample predictions** from each using walk-forward CV.
-- Train a simple meta-model (Ridge regression or logistic regression) on those predictions.
-- The meta-model learns *when* to trust which base model.
-- **Critical rule:** The meta-model must ONLY see out-of-sample predictions from base models. Otherwise you will massively overfit.
-- Keep the meta-learner simple (Ridge regression is usually enough).
-
-**Level 4 — Regime-Based Blending (Advanced)**
-Weight models differently depending on detected market regime (trending vs mean-reverting, high vs low volatility).
-
-### Expanding the Ensemble (Future)
-Once the 2-model ensemble works, consider adding:
-- Random Forest (uncorrelated tree-based errors)
-- Simple neural network (different inductive bias)
-- Naive momentum/mean-reversion signal (simple but often uncorrelated)
-
----
-
-## Research: MA Trend + Pullback Entry Strategy
-
-**Concept:** Two-stage approach — (1) RF predicts MA direction, (2) combine with price position relative to MA for entry timing. Trade pullbacks in the direction of the trend.
-
-**Signal logic:**
-- MA rising + price below MA → strong long (+1.0, buying the pullback)
-- MA falling + price above MA → strong short (-1.0, selling the bounce)
-- MA rising + price above MA → weak long (+0.5, trend priced in)
-- MA falling + price below MA → weak short (-0.5, trend priced in)
-
-**SPY daily results (initial test):**
-- MA direction accuracy: 88.5% — but misleading due to class imbalance (SPY SMA_20 rises 66% of the time)
-- All variants net Sharpe negative (-0.11 to -0.17)
-- Underperforms base RF (target_ret, net Sharpe 0.313 filtered)
-
-**Why it didn't work on SPY:**
-- SMA_20 direction is too slow/easy — 88.5% accuracy mostly reflects the base rate
-- By the time SMA_20 changes direction, the move is largely over
-- Entry timing (pullback logic) did help with drawdown reduction
-
-**Future improvements to try:**
-- Faster MA target (EMA_12 direction instead of SMA_20)
-- Predict `target_ret_5` (5-bar forward return) — smoother than 1-bar, more actionable than MA direction
-- Test on trending/more balanced assets (TLT, GLD) where MA direction isn't 66/34 skewed
-- Use MA direction as a **regime filter on top of base RF** rather than standalone strategy
-
-**New target columns added to features.py:**
-- `target_ret_5`: Forward 5-bar cumulative log return
-- `target_sign_5`: Sign of forward 5-bar return
-- `target_ma_dir`: SMA_20 direction over next 5 bars (+1=rising, -1=falling)
-
-**Code:** `src/strategy_ma_trend.py` (standalone, does not modify train.py)
-
----
-
-## Project Roadmap
-
-### Phase 1: Daily Model (1-5 Day Horizon) ← CURRENT
-**Objective:** Build the full pipeline and establish a working baseline.
-
-**Step 1 — Feature Engineering**
-- Compute all 30 features from raw OHLCV (see Feature Set above)
-- Both 4h and daily timeframes
-- Target: sign or magnitude of next-period return
-
-**Step 2 — Base Models**
-- Train Ridge/Lasso regression on clean features
-- Train XGBoost on same or expanded feature set
-- Use walk-forward (expanding or rolling window) cross-validation
-- Evaluate each model independently: Sharpe ratio, accuracy, hit rate, profit factor
-
-**Step 3 — Simple Ensemble (0.5 * each)**
-```
-ensemble_signal = 0.5 * ridge_pred + 0.5 * xgboost_pred
-```
-- Compare ensemble Sharpe/accuracy vs individual models
-- Confirm that combining actually improves out-of-sample performance
-
-**Step 4 — Meta-Model (Stacking)**
-- Generate OOS predictions from both base models via walk-forward CV
-- Train Ridge meta-learner on stacked predictions
-- Evaluate improvement over simple averaging
-- Add additional base learners if stacking shows promise
-
-**Step 5 — Backtesting & Evaluation**
-- Simulate realistic trading with transaction costs
-- Evaluate: Sharpe ratio, max drawdown, turnover, profit factor
-- Stress test across different market regimes (bull, bear, sideways, high vol)
-
-### Phase 2: Medium-Term Model (1-4 Weeks) — FUTURE
-- Shift features to momentum, earnings revisions, fund flows
-- Reduce model complexity (fewer features, stronger regularization)
-- Handle overlapping returns carefully
-- Consider cross-sectional ranking approach
-
-### Phase 3: Multi-Horizon Blending — FUTURE
-- Combine short-term and medium-term signals
-- Portfolio optimizer on top to size positions
-- Risk management layer (max drawdown, sector limits, leverage constraints)
+### Meta-Learner Rules
+- Meta-learner must ONLY see out-of-sample predictions from base models.
+- Keep meta-learner simple (Ridge regression).
+- Walk-forward validate the meta-learner itself — never train and test on same period.
 
 ---
 
 ## Critical Warning: Walk-Forward CV for Stacking
 
-**This is the trickiest and most important part of the stacking pipeline.**
-
-When generating out-of-sample predictions from base models for the meta-learner (Phase 1, Step 4), the walk-forward cross-validation must be implemented correctly. Getting this wrong — accidentally leaking future information — is the single most common mistake in quantitative ML. It will make your backtest results look incredible and then fail completely in live trading.
-
-### What Can Go Wrong
-- If base models see ANY future data during training, their "out-of-sample" predictions are contaminated.
-- If the meta-learner trains on predictions that were generated using data from the same period it's trying to predict, you have leakage.
-- Even subtle leakage (e.g., using a feature normalized with the full dataset mean instead of the rolling mean up to that point) can inflate results dramatically.
+When generating out-of-sample predictions from base models for the meta-learner, the walk-forward cross-validation must be implemented correctly. Getting this wrong — accidentally leaking future information — is the single most common mistake in quantitative ML.
 
 ### How to Do It Correctly
-1. Define a rolling or expanding training window for base models.
+1. Define expanding training window for base models.
 2. At each step, train base models ONLY on data up to time T.
-3. Generate predictions for time T+1 (or T+1 to T+k) — these are genuinely out-of-sample.
-4. Slide the window forward and repeat.
-5. Collect all OOS predictions across the full timeline.
-6. ONLY THEN train the meta-learner on these collected OOS predictions.
-7. The meta-learner itself should also be validated walk-forward — never train and test it on the same period.
+3. Generate predictions for time T+1 — these are genuinely out-of-sample.
+4. Slide window forward and repeat.
+5. ONLY THEN train the meta-learner on collected OOS predictions.
+6. Walk-forward validate the meta-learner itself.
 
 ### Red Flags That You Have Leakage
-- Backtest Sharpe ratio above 3-4 (almost certainly too good to be true for daily equity models).
-- Massive performance drop when you add even one day of delay to predictions.
-- Model performs nearly perfectly in-sample and dramatically worse in the most recent out-of-sample period.
-- Accuracy is suspiciously consistent across all time periods and market regimes.
+- Backtest Sharpe above 3-4 (too good for daily equity models).
+- Massive performance drop when adding one day of delay.
+- Suspiciously consistent accuracy across all market regimes.
+
+---
+
+## Project Roadmap
+
+### Phase 1: Equity Daily Model ✅ COMPLETE
+Best result: RF + target_bucket + curated_14 = 0.607 net Sharpe (SPY), 0.918 (QQQ).
+
+### Phase 2: Multi-Asset Equity Portfolio ✅ COMPLETE
+Equal-weight portfolio (6 assets): 0.656 Sharpe. QQQ alone (0.918) beats portfolio.
+
+### Phase 3: BTC Daily Model ✅ COMPLETE
+RF + target_bucket_10 + forward_4: **1.287 net Sharpe, 111% annualized, profitable in all regimes.**
+
+### Phase 4: BTC 4h Model ✅ CLOSED (daily is better)
+- [x] Standard features fail on 4h (max 0.281 Sharpe)
+- [x] Intraday-calibrated features (RSI-30, Stoch-200, disparity_7, etc.) tested → best 0.431 Sharpe
+- [x] Decision: 4h is structurally weaker, not worth infrastructure complexity vs daily 1.287 Sharpe
+
+### Phase 4.5: BTC Paper Trading ← NEXT
+- [ ] `src/btc_train.py`: train RF on all available data (forward_4), save model to disk
+- [ ] `src/btc_predict.py`: fetch last N days from Kraken API, compute features, output LONG/SHORT/FLAT
+- [ ] Daily cron job: run predict after UTC close, log signal + price
+- [ ] Track paper trades for 30+ days before live deployment
+
+### Phase 5: On-Chain + Derivatives Data (Future)
+Free on-chain data (Binance funding rates, blockchain.com) tested — didn't improve forward_4.
+Premium data still worth trying:
+- Glassnode API: hashrate, block size, realized value, UTXO metrics (full history from 2014+)
+- Binance/Bybit: open interest, liquidation levels (higher quality funding rate data)
+- Google Trends: "bitcoin", "blockchain" search volume
+
+### Phase 6: Equity Fundamental Model (Future)
+3-6 month horizon, cross-sectional stock ranking.
+- Inputs: P/E, EV/EBITDA, revenue growth, ROE, earnings revisions, 6-month momentum
+- Model: Ridge or logistic regression (data scarce at quarterly frequency)
+- Data: Koyfin (web scraping needed — no API), SimFin, Sharadar
 
 ---
 
@@ -538,3 +402,5 @@ When generating out-of-sample predictions from base models for the meta-learner 
 4. **Statistical significance matters.** A short backtest proving "it works" is likely luck. Need enough trades for confidence.
 5. **Beware survivorship bias** in stock universe — include delisted stocks if possible.
 6. **Regime-test everything.** A strategy that only works in bull markets is not a strategy.
+7. **Match bucket threshold to timeframe.** Too narrow = too much noise. Too wide = model never trades. Sweet spot: 30-40% neutral class.
+8. **Different timeframes need different features.** Period lengths AND indicator types must match the timescale.

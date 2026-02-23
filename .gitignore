@@ -4,3 +4,36 @@
 *.swp
 *.swo
 *~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Data (large — download locally via btc_data.py or TradingView export)
+data/
+!data/.gitkeep
+
+# Trained models (large binaries — store in S3, regenerate via btc_train.py)
+models/
+!models/.gitkeep
+
+# Backtest outputs (large — regenerate locally)
+outputs/
+!outputs/.gitkeep
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

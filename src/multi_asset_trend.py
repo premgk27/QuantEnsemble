@@ -450,147 +450,93 @@ def main():
         monthly_yearly_breakdown(net_rets_s, oos_dates, label=ticker)
 
     # ------------------------------------------------------------------
-    # Per-asset optimized features: top 14 by RF importance per asset
+    # Probability threshold: only trade when RF is confident
     # ------------------------------------------------------------------
     print(f"\n{'='*70}")
-    print(f"  Per-Asset Optimized Features (top 14 by RF importance)")
+    print(f"  Probability Thresholds: trade only when P(class) > threshold")
     print(f"{'='*70}")
 
-    for ticker, data in asset_data.items():
-        all_feat = [c for c in data.columns
-                    if not c.startswith("target_") and c != "asset" and c not in DROP_COLS]
-
-        X_all = data[all_feat].values
-        y_all = data["target_bucket"].values
-
-        # Get feature importance from first 50% of data (enough for stable ranking,
-        # avoids using full dataset which would be stronger lookahead)
-        rank_cutoff = len(X_all) // 2
-        rf_rank = RandomForestClassifier(
-            n_estimators=500, max_depth=5, max_features="sqrt",
-            min_samples_leaf=50, random_state=42, n_jobs=-1,
-        )
-        rf_rank.fit(X_all[:rank_cutoff], y_all[:rank_cutoff])
-        print(f"  {ticker}: ranking features on first {rank_cutoff} rows ({rank_cutoff/len(X_all):.0%} of data)")
-        imp = pd.Series(rf_rank.feature_importances_, index=all_feat).sort_values(ascending=False)
-        top14 = list(imp.head(14).index)
-
-        print(f"\n  {ticker} top 14: {top14}")
-
-        # Walk-forward with per-asset features
-        X_opt = data[top14].values
-        y_pnl = data["target_ret"].values
-        dates_opt = data.index
-
-        results_opt = []
-        t = INITIAL_TRAIN
-        while t < len(X_opt):
-            test_end = min(t + STEP_SIZE, len(X_opt))
-            model = make_rf_clf()
-            model.fit(X_opt[:t], y_all[:t])
-            preds = model.predict(X_opt[t:test_end])
-            for i, (p, a) in enumerate(zip(preds, y_pnl[t:test_end])):
-                results_opt.append((t + i, p, a))
-            t = test_end
-
-        indices_o = np.array([r[0] for r in results_opt], dtype=int)
-        preds_o = np.array([r[1] for r in results_opt])
-        actuals_o = np.array([r[2] for r in results_opt])
-        pos_o = preds_to_positions_bucketed(preds_o)
-        m_opt = evaluate_positions(pos_o, actuals_o, cost_bps=COST_BPS)
-
-        # Compare with curated_14
-        m_cur = all_results.get(f"single|rf|{ticker}|bucket", {}).get("metrics", {})
-        cur_sharpe = m_cur.get("sharpe_net", 0)
-        delta = m_opt["sharpe_net"] - cur_sharpe
-
-        all_results[f"optimized|rf|{ticker}|bucket"] = {"metrics": m_opt, "features": top14}
-        print(f"    Optimized: S(n)={m_opt['sharpe_net']:.3f}  WinRate={m_opt['win_rate']:.1%}  "
-              f"AnnRet={m_opt['annual_return_net']:.1%}  TotRet={m_opt['total_return_net']:.2f}  "
-              f"Turn={m_opt['avg_turnover']:.3f}  MaxDD={m_opt['max_dd_net']:.4f}")
-        print(f"    Curated:   S(n)={cur_sharpe:.3f}")
-        print(f"    Delta:     {delta:+.3f} {'BETTER' if delta > 0 else 'WORSE'}")
-
-    # Comparison table
-    print(f"\n  {'='*70}")
-    print(f"  {'Asset':<6} {'Curated S(n)':>14} {'Optimized S(n)':>16} {'Delta':>8}")
-    print(f"  {'-'*50}")
-    for ticker in ASSETS:
-        cur = all_results.get(f"single|rf|{ticker}|bucket", {}).get("metrics", {}).get("sharpe_net", 0)
-        opt = all_results.get(f"optimized|rf|{ticker}|bucket", {}).get("metrics", {}).get("sharpe_net", 0)
-        print(f"  {ticker:<6} {cur:>14.3f} {opt:>16.3f} {opt-cur:>+8.3f}")
-
-    # ------------------------------------------------------------------
-    # Class imbalance fix: class_weight="balanced" on curated_14
-    # ------------------------------------------------------------------
-    print(f"\n{'='*70}")
-    print(f"  Class Imbalance Fix: RF with class_weight='balanced' (curated_14)")
-    print(f"{'='*70}")
+    # RF classes are [-1, 0, 1] — predict_proba gives [P(-1), P(0), P(+1)]
+    THRESHOLDS = [0.40, 0.45, 0.50, 0.55, 0.60]
 
     for ticker, data in asset_data.items():
         avail_cols = [f for f in feature_cols if f in data.columns]
-        X_bal = data[avail_cols].values
-        y_bal = data["target_bucket"].values
-        y_pnl_bal = data["target_ret"].values
-        dates_bal = data.index
+        X_prob = data[avail_cols].values
+        y_prob = data["target_bucket"].values
+        y_pnl_prob = data["target_ret"].values
 
-        results_bal = []
+        # Walk-forward: collect probabilities
+        all_probs = []  # (idx, prob_down, prob_neutral, prob_up, actual_pnl)
         t = INITIAL_TRAIN
-        while t < len(X_bal):
-            test_end = min(t + STEP_SIZE, len(X_bal))
-            model = make_rf_clf(balanced=True)
-            model.fit(X_bal[:t], y_bal[:t])
-            preds = model.predict(X_bal[t:test_end])
-            for i, (p, a) in enumerate(zip(preds, y_pnl_bal[t:test_end])):
-                results_bal.append((t + i, p, a))
+        while t < len(X_prob):
+            test_end = min(t + STEP_SIZE, len(X_prob))
+            model = make_rf_clf()
+            model.fit(X_prob[:t], y_prob[:t])
+            probs = model.predict_proba(X_prob[t:test_end])
+            # Ensure class order is [-1, 0, 1]
+            classes = model.named_steps["rf"].classes_
+            class_order = {c: i for i, c in enumerate(classes)}
+            for i in range(len(probs)):
+                p_down = probs[i][class_order[-1]] if -1 in class_order else 0
+                p_neut = probs[i][class_order[0]] if 0 in class_order else 0
+                p_up = probs[i][class_order[1]] if 1 in class_order else 0
+                all_probs.append((t + i, p_down, p_neut, p_up, y_pnl_prob[t + i]))
             t = test_end
 
-        indices_b = np.array([r[0] for r in results_bal], dtype=int)
-        preds_b = np.array([r[1] for r in results_bal])
-        actuals_b = np.array([r[2] for r in results_bal])
-        pos_b = preds_to_positions_bucketed(preds_b)
-        m_bal = evaluate_positions(pos_b, actuals_b, cost_bps=COST_BPS)
+        probs_arr = np.array(all_probs)
+        p_down = probs_arr[:, 1]
+        p_neut = probs_arr[:, 2]
+        p_up = probs_arr[:, 3]
+        actuals = probs_arr[:, 4]
 
-        m_cur = all_results.get(f"single|rf|{ticker}|bucket", {}).get("metrics", {})
-        cur_sharpe = m_cur.get("sharpe_net", 0)
-        delta = m_bal["sharpe_net"] - cur_sharpe
+        cur_sharpe = all_results.get(f"single|rf|{ticker}|bucket", {}).get("metrics", {}).get("sharpe_net", 0)
+        print(f"\n  {ticker} (default S(n)={cur_sharpe:.3f}):")
+        print(f"    {'Thresh':>8} {'S(n)':>8} {'WinR':>8} {'AnnRet':>8} {'Turn':>8} {'MaxDD':>8} {'Trades%':>8}")
 
-        all_results[f"balanced|rf|{ticker}|bucket"] = {"metrics": m_bal}
-        print(f"\n  {ticker}:")
-        print(f"    Balanced:  S(n)={m_bal['sharpe_net']:.3f}  WinRate={m_bal['win_rate']:.1%}  "
-              f"AnnRet={m_bal['annual_return_net']:.1%}  Turn={m_bal['avg_turnover']:.3f}  "
-              f"MaxDD={m_bal['max_dd_net']:.4f}")
-        print(f"    Default:   S(n)={cur_sharpe:.3f}")
-        print(f"    Delta:     {delta:+.3f} {'BETTER' if delta > 0 else 'WORSE'}")
+        for thresh in THRESHOLDS:
+            # Position: +1 if P(up) > thresh, -1 if P(down) > thresh, else 0
+            positions = np.zeros(len(p_up))
+            for i in range(len(positions)):
+                if p_up[i] > thresh:
+                    positions[i] = 1.0
+                elif p_down[i] > thresh:
+                    positions[i] = -1.0
+                else:
+                    positions[i] = 0.0  # not confident enough
 
-        # Show yearly comparison for crash years
-        oos_dates_b = dates_bal[indices_b]
-        turnover_b = np.abs(np.diff(pos_b, prepend=0))
-        costs_b = turnover_b * (COST_BPS / 10_000)
-        net_rets_b = pos_b * actuals_b - costs_b
-        df_b = pd.DataFrame({"net_ret": net_rets_b}, index=oos_dates_b)
-        yearly_b = df_b.groupby(df_b.index.year)["net_ret"].sum()
+            # For neutral predictions, hold previous position
+            for i in range(1, len(positions)):
+                if positions[i] == 0:
+                    positions[i] = positions[i - 1]
 
-        # Get default yearly for comparison
-        idx_d = all_results.get(f"single|rf|{ticker}|bucket", {}).get("metrics", {})
-        # We need the default yearly returns — recalculate from stored data
-        # Just show balanced yearly for crash years
-        crash_years = [2000, 2001, 2002, 2007, 2008, 2009, 2018, 2020, 2022]
-        available_crashes = [y for y in crash_years if y in yearly_b.index]
-        if available_crashes:
-            print(f"    Crash years (balanced): ", end="")
-            for y in available_crashes:
-                print(f"{y}:{yearly_b[y]:+.3f}  ", end="")
-            print()
+            m_prob = evaluate_positions(positions, actuals, cost_bps=COST_BPS)
+            pct_active = np.mean(positions != 0) * 100
+            key = f"prob|rf|{ticker}|t{int(thresh*100)}"
+            all_results[key] = {"metrics": m_prob}
 
-    # Summary table
+            marker = " ***" if m_prob["sharpe_net"] > cur_sharpe else ""
+            print(f"    {thresh:>8.2f} {m_prob['sharpe_net']:>8.3f} "
+                  f"{m_prob['win_rate']:>8.1%} {m_prob['annual_return_net']:>8.1%} "
+                  f"{m_prob['avg_turnover']:>8.3f} {m_prob['max_dd_net']:>8.4f} "
+                  f"{pct_active:>7.1f}%{marker}")
+
+    # Best threshold per asset
     print(f"\n  {'='*70}")
-    print(f"  {'Asset':<6} {'Default S(n)':>14} {'Balanced S(n)':>15} {'Delta':>8}")
+    print(f"  Best probability threshold per asset:")
+    print(f"  {'Asset':<6} {'Default':>10} {'Best Prob':>10} {'Thresh':>8} {'Delta':>8}")
     print(f"  {'-'*50}")
     for ticker in ASSETS:
         cur = all_results.get(f"single|rf|{ticker}|bucket", {}).get("metrics", {}).get("sharpe_net", 0)
-        bal = all_results.get(f"balanced|rf|{ticker}|bucket", {}).get("metrics", {}).get("sharpe_net", 0)
-        print(f"  {ticker:<6} {cur:>14.3f} {bal:>15.3f} {bal-cur:>+8.3f}")
+        best_sharpe = cur
+        best_thresh = "none"
+        for thresh in THRESHOLDS:
+            key = f"prob|rf|{ticker}|t{int(thresh*100)}"
+            s = all_results.get(key, {}).get("metrics", {}).get("sharpe_net", 0)
+            if s > best_sharpe:
+                best_sharpe = s
+                best_thresh = f"{thresh:.2f}"
+        delta = best_sharpe - cur
+        print(f"  {ticker:<6} {cur:>10.3f} {best_sharpe:>10.3f} {best_thresh:>8} {delta:>+8.3f}")
 
     # ------------------------------------------------------------------
     # Portfolio combination: equal-weight across single-asset models

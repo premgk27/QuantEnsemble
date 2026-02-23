@@ -378,15 +378,194 @@ def compute_target(df: pd.DataFrame, timeframe: str = "daily") -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Group I: Intraday / 4h-Specific Features
+# Based on academic research: Hafid et al. (2024), Gradojevic et al. (2023)
+# ---------------------------------------------------------------------------
+
+def compute_intraday_features(df: pd.DataFrame, timeframe: str = "4h") -> pd.DataFrame:
+    """Features calibrated for intraday (4h) timeframes.
+
+    Includes longer-period oscillators (RSI-30, Stoch-200/30, Momentum-30),
+    Williams %R, Disparity index, hour-of-day encoding, bar pattern features.
+    These complement the standard feature set for sub-daily bars.
+    """
+    out = pd.DataFrame(index=df.index)
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    op = df["open"]
+
+    # Period helpers — use raw bar counts (not day-based) for intraday
+    # At 4h bars: 30 bars = 5 days, 200 bars = ~33 days
+    p7 = _period(7, timeframe)    # ~1 week
+    p30 = 30                       # 30 bars (5 days at 4h, fixed)
+    p200 = 200                     # 200 bars (~33 days at 4h, fixed)
+
+    # RSI-30 (Hafid et al. top feature — longer period captures more context at 4h)
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = (-delta).where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1/p30, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/p30, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    out["rsi_30"] = 100 - (100 / (1 + rs))
+
+    # Stochastic %K at 30-period (Hafid et al. top feature)
+    lowest_low_30 = low.rolling(p30).min()
+    highest_high_30 = high.rolling(p30).max()
+    denom_30 = highest_high_30 - lowest_low_30
+    out["stoch_k_30"] = np.where(
+        denom_30 > 0,
+        100 * (close - lowest_low_30) / denom_30,
+        50.0,
+    )
+
+    # Stochastic %K at 200-period (Hafid et al. — captures longer regime)
+    lowest_low_200 = low.rolling(p200).min()
+    highest_high_200 = high.rolling(p200).max()
+    denom_200 = highest_high_200 - lowest_low_200
+    out["stoch_k_200"] = np.where(
+        denom_200 > 0,
+        100 * (close - lowest_low_200) / denom_200,
+        50.0,
+    )
+
+    # Momentum-30: rate of change over 30 bars (Hafid et al. top feature)
+    # Stationary: expressed as ratio - 1
+    out["momentum_30"] = (close / close.shift(p30)) - 1
+
+    # Williams %R (14-period): complement to Stochastic, range [-100, 0]
+    # Normalize to [0, 1] for model compatibility
+    p14 = _period(14, timeframe)
+    highest_high_14 = high.rolling(p14).max()
+    lowest_low_14 = low.rolling(p14).min()
+    denom_14 = highest_high_14 - lowest_low_14
+    williams_r = np.where(
+        denom_14 > 0,
+        -100 * (highest_high_14 - close) / denom_14,
+        -50.0,
+    )
+    out["williams_r"] = (pd.Series(williams_r, index=df.index) + 100) / 100  # normalize to [0,1]
+
+    # Disparity-7: (close / SMA_7) - 1 — very short-term deviation from mean
+    sma7 = close.rolling(p7).mean()
+    out["disparity_7"] = (close / sma7) - 1
+
+    # Hour of day (sin/cos encoded) — captures Asian/London/NY session patterns
+    # 24/7 crypto has distinct volume/momentum patterns by UTC hour
+    if hasattr(df.index, 'hour'):
+        hour = df.index.hour
+        out["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+        out["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    else:
+        out["hour_sin"] = 0.0
+        out["hour_cos"] = 0.0
+
+    # Bar body ratio: (close - open) / (high - low) — conviction within bar
+    # +1 = closed at high (strong bull), -1 = closed at low (strong bear), 0 = doji
+    bar_range = high - low
+    out["bar_body_ratio"] = np.where(
+        bar_range > 0,
+        (close - op) / bar_range,
+        0.0,
+    )
+
+    # Consecutive bar direction count: how many bars in a row went same direction
+    # Captures momentum exhaustion / continuation at intraday level
+    ret_1 = np.sign(close.diff())
+    consec = pd.Series(0.0, index=df.index)
+    for i in range(1, len(ret_1)):
+        if ret_1.iloc[i] == ret_1.iloc[i - 1] and ret_1.iloc[i] != 0:
+            consec.iloc[i] = consec.iloc[i - 1] + ret_1.iloc[i]
+        else:
+            consec.iloc[i] = ret_1.iloc[i]
+    out["consec_bars"] = consec
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Group J: On-chain, Derivatives & Sentiment Features
+# ---------------------------------------------------------------------------
+
+def compute_onchain_features(df: pd.DataFrame, onchain_df: pd.DataFrame) -> pd.DataFrame:
+    """Align on-chain/sentiment data to OHLCV index and build model-ready features.
+
+    On-chain data starts later than price history:
+      - Hash rate / tx count: 2009 (full coverage)
+      - Fear & Greed: 2018-02
+      - Funding rate: 2019-09
+
+    Missing values filled with 0 (neutral) — treated as "no signal" not "bad signal".
+
+    Args:
+        df: OHLCV DataFrame with DatetimeIndex.
+        onchain_df: Output of onchain_loader.load_all_onchain().
+
+    Returns:
+        DataFrame aligned to df.index with on-chain features.
+    """
+    out = pd.DataFrame(index=df.index)
+
+    # Normalize both indexes to UTC date-level for alignment
+    price_dates = df.index.normalize()
+    onchain_norm = onchain_df.copy()
+    onchain_norm.index = onchain_norm.index.normalize()
+
+    def align(col: str, fill_value: float = 0.0) -> pd.Series:
+        """Reindex on-chain series to match price index, fill gaps."""
+        if col not in onchain_norm.columns:
+            return pd.Series(fill_value, index=df.index)
+        s = onchain_norm[col].reindex(price_dates)
+        # Forward-fill up to 3 days (weekend/holiday gaps), then fill remainder
+        s = s.ffill(limit=3).fillna(fill_value)
+        s.index = df.index
+        return s
+
+    # --- Funding rate (from 2019-09) ---
+    # Positive = longs pay shorts = market is net long = bullish sentiment / overleveraged
+    # Negative = shorts pay longs = market is net short = bearish / fear
+    out["funding_rate"] = align("funding_rate_daily", fill_value=0.0)
+    out["funding_rate_7d"] = align("funding_rate_7d", fill_value=0.0)
+    # Annualized funding as a regime indicator (> 0.5 = frothy bull, < -0.5 = panic)
+    out["funding_rate_ann"] = align("funding_rate_ann", fill_value=0.0)
+
+    # --- Fear & Greed (from 2018-02) ---
+    # Normalized to [-1, 1]: -1 = extreme fear (buy signal), +1 = extreme greed (sell signal)
+    out["fear_greed"] = align("fear_greed_norm", fill_value=0.0)
+    out["fear_greed_7d"] = align("fear_greed_7d", fill_value=50.0)
+    out["fear_greed_7d"] = (out["fear_greed_7d"] - 50) / 50  # normalize 7d too
+
+    # --- Hash rate (from 2009, essentially full coverage) ---
+    # hash_rate_ratio_30d > 1 = miners expanding (bullish), < 1 = miners capitulating
+    out["hash_rate_ratio"] = align("hash_rate_ratio_30d", fill_value=1.0)
+    out["log_hash_rate"] = align("log_hash_rate", fill_value=0.0)
+
+    # --- Transaction count (from 2009) ---
+    # tx_count_ratio_30d > 1 = network more active than usual (bullish on-chain activity)
+    out["tx_count_ratio"] = align("tx_count_ratio_30d", fill_value=1.0)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def build_features(df: pd.DataFrame, timeframe: str = "daily") -> pd.DataFrame:
+def build_features(df: pd.DataFrame, timeframe: str = "daily",
+                   include_intraday: bool = False,
+                   onchain_df=None,
+                   drop_target_nans: bool = True) -> pd.DataFrame:
     """Compute all features + target from raw OHLCV.
 
     Args:
         df: DataFrame with columns: open, high, low, close, volume.
         timeframe: "daily" or "4h" — controls period translation.
+        include_intraday: Add 4h-specific features (RSI-30, Stoch-200, etc.).
+        onchain_df: Optional output of onchain_loader.load_all_onchain().
+                    If provided, adds funding rate, Fear & Greed, hash rate, tx count.
+        drop_target_nans: If False, keep the last row(s) with NaN targets.
+                          Set to False for live prediction (last bar has no forward target).
 
     Returns:
         DataFrame with all features and target, warmup NaNs trimmed.
@@ -403,16 +582,29 @@ def build_features(df: pd.DataFrame, timeframe: str = "daily") -> pd.DataFrame:
         compute_target(df, timeframe),
     ]
 
+    if include_intraday:
+        parts.append(compute_intraday_features(df, timeframe))
+
+    if onchain_df is not None:
+        parts.append(compute_onchain_features(df, onchain_df))
+
     result = pd.concat(parts, axis=1)
 
-    # Trim warmup NaNs (keep only rows where all features are valid)
-    feature_cols = [c for c in result.columns if not c.startswith("target_")]
-    result = result.dropna(subset=feature_cols)
+    # Trim warmup NaNs (keep only rows where all OHLCV-derived features are valid)
+    # On-chain features are already NaN-filled so they don't drive dropna
+    ohlcv_feature_cols = [c for c in result.columns
+                          if not c.startswith("target_")
+                          and c not in ("funding_rate", "funding_rate_7d",
+                                        "funding_rate_ann", "fear_greed",
+                                        "fear_greed_7d", "hash_rate_ratio",
+                                        "log_hash_rate", "tx_count_ratio")]
+    result = result.dropna(subset=ohlcv_feature_cols)
 
     # Drop trailing rows where forward-looking targets are NaN
-    # (target_ret_5 and target_ma_dir need 5+ future bars)
-    target_cols = [c for c in result.columns if c.startswith("target_")]
-    result = result.dropna(subset=target_cols)
+    # Skip this in prediction mode — the last bar has no forward target yet
+    if drop_target_nans:
+        target_cols = [c for c in result.columns if c.startswith("target_")]
+        result = result.dropna(subset=target_cols)
 
     return result
 
